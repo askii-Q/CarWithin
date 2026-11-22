@@ -75,7 +75,9 @@ final class TailingSocket: @unchecked Sendable {
         }
     }
 
-    func accept(remoteIP: String) throws -> TailingSocket {
+    /// 接受一条连接。`onPeer` 会在做任何判断之前拿到对端地址：
+    /// 仪表可能从另一个网卡地址回连，静默丢弃会让日志看起来像「它根本没连过」。
+    func accept(remoteIP: String, onPeer: ((String) -> Void)? = nil) throws -> TailingSocket {
         let fd = try duplicate()
         defer { release(fd) }
         while true {
@@ -89,12 +91,14 @@ final class TailingSocket: @unchecked Sendable {
                 if errno == EAGAIN || errno == EINTR { continue }
                 throw TailingError.system("接受 TCP", errno)
             }
-            let expected = try Self.address(remoteIP, 0)
-            guard address.sin_family == sa_family_t(AF_INET),
-                  address.sin_addr.s_addr == expected.sin_addr.s_addr else {
+            guard address.sin_family == sa_family_t(AF_INET) else {
                 Darwin.close(accepted)
                 continue
             }
+            let host = UInt32(bigEndian: address.sin_addr.s_addr)
+            let peer = "\((host >> 24) & 0xff).\((host >> 16) & 0xff).\((host >> 8) & 0xff).\(host & 0xff)"
+            onPeer?(peer)
+            _ = remoteIP
             let socket = TailingSocket(accepted)
             do { try Self.configure(accepted); return socket }
             catch { socket.close(); throw error }

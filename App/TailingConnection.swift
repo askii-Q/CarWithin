@@ -124,7 +124,14 @@ final class TailingConnection: @unchecked Sendable {
         var listeners: [(UInt16, TailingSocket)] = []
         for port in listenPorts {
             let server = try tracked(TailingSocket.create())
-            try server.listen(localIP: localIP, port: port)
+            do {
+                try server.listen(localIP: localIP, port: port)
+            } catch {
+                // 绑不上指定地址时退回监听所有网卡：宁可多暴露一个接口，也不要因为
+                // 界面上残留的旧地址让仪表连不进来，而且日志要能看出发生了这件事。
+                try server.listen(localIP: "0.0.0.0", port: port)
+                log("\(dashboard) 无法绑定 \(localIP)：\(error.localizedDescription)，改为监听所有网卡")
+            }
             listeners.append((port, server))
         }
         for (port, server) in listeners {
@@ -182,7 +189,8 @@ final class TailingConnection: @unchecked Sendable {
     @discardableResult
     private func announce() throws -> Bool {
         let socket = try tracked(TailingSocket.create())
-        defer { socket.close() }
+        var keepOpen = false
+        defer { if !keepOpen { socket.close() } }
         do {
             try socket.connect(localIP: localIP, remoteIP: targetIP, port: ports.announcement)
         } catch {
@@ -201,8 +209,18 @@ final class TailingConnection: @unchecked Sendable {
             accepted = status
         }
         if accepted {
+            keepOpen = true
             log("\(dashboard) 仪表 \(targetIP)：\(ports.announcement) 已接受 iOS 投屏请求（第 \(announcementAttempts) 次），等待其回连 \(localIP)")
             startReverseProbeIfNeeded()
+            // 有些仪表不另开连接，直接在请求通道上继续说话；留着这条连接等 20 秒。
+            DispatchQueue.global(qos: .userInitiated).async { [self] in
+                do {
+                    try control(socket, firstResponseTimeout: 20)
+                } catch {
+                    log("\(dashboard) 请求通道在 20 秒内没有后续交互：\(error.localizedDescription)")
+                    socket.close()
+                }
+            }
         } else {
             log("\(dashboard) 仪表暂未接受 iOS 投屏请求，\(Int(announcementRetryInterval)) 秒后重试")
         }
@@ -384,7 +402,11 @@ final class TailingConnection: @unchecked Sendable {
         let role = portRole(port)
         do {
             while true {
-                let socket = try tracked(server.accept(remoteIP: targetIP))
+                let socket = try tracked(server.accept(remoteIP: targetIP) { [self] peer in
+                    if peer != targetIP {
+                        log("\(dashboard) 收到来自 \(peer) 的连接（不是配置里的仪表地址 \(targetIP)），仍然接受")
+                    }
+                })
                 // 每次回连都记录：实测日志里最缺的就是「仪表到底连了哪个端口」。
                 log("\(dashboard) 仪表回连 TCP\(port)（\(role)）")
                 if isVideoPort(port) {
@@ -434,7 +456,14 @@ final class TailingConnection: @unchecked Sendable {
             }
             var payload = Data()
             switch request.command {
-            case 0x10000, 0x20000, 0x10740, 0x10040, 0x70000000:
+            case 0x10000:
+                // 官方实现在这里先回 0x10001 才继续等 CLIENT_INFO；不回的话仪表可能一直挂着。
+                try socket.write(TailingProtocol.control(0x10001, identifier: request.identifier))
+            case 0x20000:
+                try socket.write(TailingProtocol.control(0x20001, identifier: request.identifier))
+            case 0x30000:
+                try socket.write(TailingProtocol.control(0x30001, identifier: request.identifier))
+            case 0x10740, 0x10040, 0x70000000:
                 break
             case 0x10690 where isZeeho, 0x10780 where isZeeho:
                 // 极核上报 FTP 速率和运行日志，投屏会话只确认收到。
