@@ -155,6 +155,11 @@ final class TailingConnection: @unchecked Sendable {
                 condition.unlock()
                 throw TailingError.timeout("等待仪表回连超时（\(Int(negotiationTimeout)) 秒）：\(progress)。请先退出仪表上的官方投屏，再重新开启投屏，并保持本页不动")
             }
+            // 本轮 announce 可能在关闭后才失败返回，等待前再确认一次，避免多睡一个重试间隔。
+            condition.lock()
+            let cancelledNow = closed
+            condition.unlock()
+            if cancelledNow { throw TailingError.closed }
             condition.lock()
             _ = condition.wait(until: min(deadline, nextAttempt))
             let progress = progressLocked()
