@@ -80,6 +80,13 @@ final class TailingConnection: @unchecked Sendable {
     private var isZeeho: Bool { profile.isZeeho }
     private var dashboard: String { profile.isZeeho ? "极核" : "台铃" }
 
+    /// 只取前三段做同网段比较：车载热点几乎都是 /24，够用且不会误判。
+    static func subnet24(_ ip: String) -> String? {
+        let parts = ip.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count == 4 else { return nil }
+        return parts.prefix(3).joined(separator: ".")
+    }
+
     /// 旧 RV 通道（10711/10710）与新媒体通道（10921/10920）在官方 App 里走同一套
     /// 线程与命令集，只影响日志标注与「谁是数据通道」的判定。
     private func portRole(_ port: UInt16) -> String {
@@ -139,6 +146,11 @@ final class TailingConnection: @unchecked Sendable {
         }
         let summary = listenPorts.map { "\($0)（\(portRole($0))）" }.joined(separator: "，")
         log("\(dashboard) TCP 已监听 \(localIP)：\(summary)，正在协商")
+        // 仪表是「回连方」：它只连得到同一网段里的手机。跨网段时仪表仍能收到投屏请求并回
+        // accepted，却永远拨不回来，日志表现为「接受了 N 次、一次也不连」。
+        if let localNet = Self.subnet24(localIP), let targetNet = Self.subnet24(targetIP), localNet != targetNet {
+            log("\(dashboard) 注意：本机 \(localIP) 与仪表 \(targetIP) 不在同一网段，仪表通常回连不过来。请把 iPhone 接到仪表自己开的热点上（投屏开启后出现），再填那个热点的网关地址")
+        }
         // 仪表可能晚于本机进入投屏状态，也可能正被官方 App 占用而短暂拒绝连接。
         // 协商窗口内持续重发投屏请求，任意一次成功即可，而不是一次失败就结束会话。
         let deadline = Date().addingTimeInterval(negotiationTimeout)
