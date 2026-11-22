@@ -15,7 +15,7 @@ concurrency:
 jobs:
   ipa:
     name: 构建未签名 IPA
-    runs-on: macos-13
+    runs-on: macos-15
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
