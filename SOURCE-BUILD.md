@@ -6,6 +6,21 @@
 
 发布安装包与源码应对应同一代码版本。第三方许可与来源见 THIRD_PARTY_NOTICES.txt 和 LICENSES。
 
+## 让装好的包直接带身份
+
+应用启动时按三条路径找身份：Keychain（同签名、同 Team 的旧安装遗留）→ 应用包内置资源 → 手动导入。CI 里的干净构建三者都没有，所以会显示「需要导入 MFi 身份」，启动按钮置灰。要出货即用，二选一：
+
+```bash
+# 1) 本机 macOS：把三件套放进被 .gitignore 忽略的目录，再打包
+mkdir -p App/BundledIdentity
+# certificate.p7b / leaf.cer / private.x963 三个文件名必须一字不差
+bash Tools/build_ipa.sh
+```
+
+2) GitHub Actions：仓库变量 `INJECT_MFI_IDENTITY=true`，并配置 Secrets `MFI_CERTIFICATE_P7B_B64`、`MFI_LEAF_CER_B64`、`MFI_PRIVATE_X963_B64`（文件内容 base64），`ipa.yml` 会在构建前把它们写进 `App/BundledIdentity/`。注入后的 IPA 内含身份材料，公开仓库的 artifact 会被他人下载，私有使用请把仓库设为 private 或改走本机打包。
+
+身份材料缺失时应用仍可编译、可起 HTTP 接收页，只是无法启动本机 CarPlay。
+
 ## 初始化自检
 
 首次克隆或换机器后，先运行：

@@ -25,6 +25,26 @@ jobs:
           xcodebuild -version
           xcodebuild -showsdks | grep -i iphoneos || true
 
+      - name: 注入 MFi 身份（可选）
+        # 只有把仓库变量 INJECT_MFI_IDENTITY 设成 true 且配好三个 Secret 时才会执行。
+        # 注意：注入后产物 IPA 里就带着身份材料，公开仓库的 artifact 会被其他人下载到，
+        # 私有使用请把仓库设为 private，或改在本机 macOS 上 `bash Tools/build_ipa.sh` 出包。
+        if: ${{ vars.INJECT_MFI_IDENTITY == 'true' }}
+        env:
+          CERT_P7B_B64: ${{ secrets.MFI_CERTIFICATE_P7B_B64 }}
+          LEAF_CER_B64: ${{ secrets.MFI_LEAF_CER_B64 }}
+          PRIVATE_X963_B64: ${{ secrets.MFI_PRIVATE_X963_B64 }}
+        run: |
+          set -euo pipefail
+          for name in CERT_P7B_B64 LEAF_CER_B64 PRIVATE_X963_B64; do
+            if [ -z "${!name:-}" ]; then echo "缺少 Secret：$name"; exit 1; fi
+          done
+          mkdir -p App/BundledIdentity
+          printf '%s' "$CERT_P7B_B64" | base64 --decode > App/BundledIdentity/certificate.p7b
+          printf '%s' "$LEAF_CER_B64" | base64 --decode > App/BundledIdentity/leaf.cer
+          printf '%s' "$PRIVATE_X963_B64" | base64 --decode > App/BundledIdentity/private.x963
+          echo "已注入 MFi 身份：$(ls -1 App/BundledIdentity | tr '\n' ' ')"
+
       - name: 生成工程并构建 IPA
         run: bash Tools/build_ipa.sh
 
