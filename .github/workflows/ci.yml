@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  core:
+    name: 核心库测试与脚本校验
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 工具链版本
+        run: |
+          swift --version
+          python3 --version
+          xcodebuild -version
+
+      - name: 校验 Tools 脚本
+        run: |
+          python3 - <<'PY'
+          import glob
+          for path in sorted(glob.glob('Tools/*.py')):
+              compile(open(path, encoding='utf-8').read(), path, 'exec')
+              print('ok', path)
+          PY
+          for script in Tools/*.sh; do bash -n "$script"; echo "ok $script"; done
+
+      - name: 构建并测试 TDSCarKitCore
+        run: |
+          swift test -c release --package-path . --scratch-path "$RUNNER_TEMP/tds-carkit-tests"
+
+      - name: 工程生成脚本可运行
+        run: |
+          python3 Tools/generate_project.py
+          git status --porcelain -- TDSCarKit.xcodeproj

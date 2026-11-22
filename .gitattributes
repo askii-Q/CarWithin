@@ -1,0 +1,43 @@
+# 统一换行：仓库内一律 LF，Windows 检出也不再改写为 CRLF。
+# 目的：避免 git status 出现整库“已修改”的噪音，并让 Tools/ 下的 shell 脚本在 macOS 上可直接执行。
+* text=auto eol=lf
+
+*.swift        text eol=lf
+*.c            text eol=lf
+*.h            text eol=lf
+*.m            text eol=lf
+*.py           text eol=lf
+*.sh           text eol=lf
+*.md           text eol=lf
+*.txt          text eol=lf
+*.yml          text eol=lf
+*.yaml         text eol=lf
+*.json         text eol=lf
+*.plist        text eol=lf
+*.pbxproj      text eol=lf
+*.xcconfig     text eol=lf
+*.entitlements text eol=lf
+*.strings      text eol=lf
+*.js           text eol=lf
+*.html         text eol=lf
+*.css          text eol=lf
+
+# 二进制资源：不做换行转换，也不参与文本 diff。
+*.png      binary
+*.jpg      binary
+*.jpeg     binary
+*.gif      binary
+*.ico      binary
+*.icns     binary
+*.pdf      binary
+*.mp4      binary
+*.ipa      binary
+*.mobileprovision binary
+*.provisionprofile binary
+*.p12      binary
+*.pfx      binary
+*.p7b      binary
+*.cer      binary
+*.pem      binary
+*.key      binary
+*.x963     binary
