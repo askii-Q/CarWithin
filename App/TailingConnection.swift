@@ -459,13 +459,24 @@ final class TailingConnection: @unchecked Sendable {
         while true {
             // 连接在两条完整消息之间可以静默，收到半条消息后仍限制读取时间。
             var readingHeader = true
-            let request = try TailingProtocol.readControl { count in
-                defer { readingHeader = false }
-                if let timeout = pendingFirstTimeout {
-                    pendingFirstTimeout = nil
-                    return try socket.readExactly(count, timeout: timeout)
+            let request: TailingProtocol.Control
+            do {
+                request = try TailingProtocol.readControl { count in
+                    defer { readingHeader = false }
+                    if let timeout = pendingFirstTimeout {
+                        pendingFirstTimeout = nil
+                        return try socket.readExactly(count, timeout: timeout)
+                    }
+                    return try socket.readExactly(count, waitForFirstByte: readingHeader)
                 }
-                return try socket.readExactly(count, waitForFirstByte: readingHeader)
+            } catch {
+                condition.lock()
+                let answeredIdentity = signedHUID != nil
+                condition.unlock()
+                if answeredIdentity {
+                    throw TailingError.channel("仪表在收到 0x10011 后主动断开（身份或能力字段不被接受）", error)
+                }
+                throw error
             }
             var payload = Data()
             // 仪表只给了半句话就断开时，日志里至少要留下它说了什么。
