@@ -77,7 +77,11 @@ enum TailingProtocol {
     }
 
     static func json(_ object: [String: Any]) throws -> Data {
-        try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+        // 不要转义斜杠：Android 侧 org.json 的 quote() 只在 '/' 紧跟 '<' 时才写 '\'
+        // （JSONObject.quote 里 `if (b == '<') write('\\')`），所以官方发出去的
+        // pubkey/encryptedHUID 里的 Base64 斜杠是裸的 '/', 而我们默认会写成 "\/"。
+        // 仪表端的解析器若按自己的转义表处理，这一处差异足以让它解不出公钥。
+        try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys, .withoutEscapingSlashes])
     }
 
     static func object(_ data: Data) throws -> [String: Any] {

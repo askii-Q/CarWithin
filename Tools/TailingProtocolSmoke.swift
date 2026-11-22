@@ -49,7 +49,23 @@ struct TailingTests {
         try simulatedInstrument(identity: stableIdentity, profile: .zeeho62)
         try rejectedInstrument()
         try cancelledHandshake()
+        try jsonEncoding()
         print("PASS: 台铃拆包/合包、长度校验、RSA1024/type1、TCP取消、模拟仪表握手/逐帧拉取/保活/重启、错误型号拒绝、协商中停止")
+    }
+
+    /// 官方（Android org.json）不会把 Base64 里的斜杠写成 `\/`，仪表端的解析器
+    /// 未必认这种转义；这里把序列化结果钉死成裸斜杠。
+    private static func jsonEncoding() throws {
+        let payload = try TailingProtocol.json(["pubkey": "a/b+c=", "count": 2])
+        let text = String(decoding: payload, as: UTF8.self)
+        guard text.contains("a/b+c="), !text.contains("\\/") else {
+            throw TestError.failed("JSON 不应转义斜杠：\(text)")
+        }
+        guard let object = try TailingProtocol.object(payload),
+              object["pubkey"] as? String == "a/b+c=",
+              (object["count"] as? NSNumber)?.intValue == 2 else {
+            throw TestError.failed("JSON 往返失败：\(text)")
+        }
     }
 
     private static func frames() throws {

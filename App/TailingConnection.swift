@@ -515,6 +515,8 @@ final class TailingConnection: @unchecked Sendable {
                 let requestText = String(decoding: request.payload, as: UTF8.self)
                 log("\(dashboard) 0x10010 请求 \(request.payload.count) 字节：\(requestText)")
                 log("\(dashboard) 0x10011 回应 \(payload.count) 字节（字段 \(fields.keys.sorted().joined(separator: ","))）")
+                // 原始字节也留在日志里：仪表若不认某个转义或类型，只有对着原文才看得出来。
+                log("\(dashboard) 0x10011 原文：\(String(decoding: payload, as: UTF8.self))")
                 try replyControl(socket, request, payload: payload)
                 condition.lock()
                 self.huid = huid; signedHUID = signature; condition.broadcast()
