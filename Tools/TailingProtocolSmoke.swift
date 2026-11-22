@@ -361,7 +361,7 @@ struct TailingTests {
         let connection = TailingConnection(localIP: "127.0.0.1", targetIP: "127.0.0.1", profile: .tailing43,
             phone: TailingPhoneInfo(package: "test.carwithin", versionCode: 2, model: "iPhone", systemVersion: "17", width: 1320, height: 2868, rotation: 0),
             ports: ports, identityProvider: { identity }, log: { line in
-                traceLock.lock(); trace.value.append(line); traceLock.unlock()
+                traceLock.lock(); var collected = trace.get(); collected.append(line); trace.set(collected); traceLock.unlock()
             })
         defer { connection.close() }
         let done = DispatchGroup(); done.enter()
@@ -378,7 +378,7 @@ struct TailingTests {
         let finished = done.wait(timeout: .now() + 3) == .success
         let elapsed = Date().timeIntervalSince(cancelStarted)
         let seconds = String(format: "%.2f", elapsed)
-        traceLock.lock(); let recent = trace.value.suffix(4).joined(separator: " | "); traceLock.unlock()
+        traceLock.lock(); let recent = trace.get().suffix(4).joined(separator: " | "); traceLock.unlock()
         try expect(finished, "协商中停止需在 3 秒内返回，实测 \(seconds) 秒；日志：\(recent)")
         try expect(stopped.get(), "协商中停止应抛出取消错误，实测 \(seconds) 秒返回")
         try expect(elapsed < 1.5, "协商中停止需及时退出，实测 \(seconds) 秒")
