@@ -81,7 +81,6 @@ final class TailingConnection: @unchecked Sendable {
     private var configured = false
     private var movieMode = false
     /// 仪表接受投屏请求后若不回连，只主动反向探测一轮，避免反复连接干扰它。
-    private var reverseProbeStarted = false
     private var isZeeho: Bool { profile.isZeeho }
     private var dashboard: String { profile.isZeeho ? "极核" : "台铃" }
 
@@ -228,7 +227,6 @@ final class TailingConnection: @unchecked Sendable {
         if accepted {
             keepOpen = true
             log("\(dashboard) 仪表 \(targetIP)：\(ports.announcement) 已接受 iOS 投屏请求（第 \(announcementAttempts) 次），等待其回连 \(localIP)")
-            startReverseProbeIfNeeded()
             // 有些仪表不另开连接，直接在请求通道上继续说话；留着这条连接等 20 秒。
             DispatchQueue.global(qos: .userInitiated).async { [self] in
                 do {
@@ -250,53 +248,6 @@ final class TailingConnection: @unchecked Sendable {
             hint = "（连接被拒绝通常是仪表正被官方 App 占用）"
         }
         log("\(dashboard) 投屏请求失败：\(error.localizedDescription)\(hint)，会继续重试")
-    }
-
-    /// 仪表在「接受投屏请求」之后始终不回连时，反过来连它自己的同名端口。
-    /// 一半是诊断：把「仪表到底有没有在听这些端口」写进日志；
-    /// 一半是兜底：若对方先开口，就按会话控制通道继续协商。
-    private func startReverseProbeIfNeeded() {
-        // 图上作业/冒烟测试里 targetIP 就是本机，反向探测只会连到自己，直接跳过。
-        guard targetIP != localIP, targetIP != "127.0.0.1", targetIP != "localhost" else { return }
-        condition.lock()
-        let skip = reverseProbeStarted || closed
-        if !skip { reverseProbeStarted = true }
-        condition.unlock()
-        guard !skip else { return }
-        DispatchQueue.global(qos: .utility).async { [self] in
-            var candidates: [UInt16] = []
-            for port in [ports.control, ports.mediaControl, ports.auxiliary] where port != 0 {
-                if !candidates.contains(port) { candidates.append(port) }
-            }
-            for port in candidates {
-                condition.lock()
-                let stop = closed || signedHUID != nil
-                condition.unlock()
-                if stop { return }
-                let socket: TailingSocket
-                do { socket = try tracked(TailingSocket.create()) } catch { return }
-                do {
-                    try socket.connect(localIP: localIP, remoteIP: targetIP, port: port, timeout: 0.7)
-                } catch {
-                    log("\(dashboard) 反向探测 \(targetIP)：\(port) 不可连接（\(error.localizedDescription)）")
-                    socket.close()
-                    continue
-                }
-                guard !isMediaControlPort(port) else {
-                    log("\(dashboard) 反向探测 \(targetIP)：\(port)（\(portRole(port))）可连接，但反过来占用媒体控制通道不安全，仅记录")
-                    socket.close()
-                    continue
-                }
-                log("\(dashboard) 反向探测 \(targetIP)：\(port)（\(portRole(port))）可连接，等待仪表先说话")
-                do {
-                    try control(socket, firstResponseTimeout: 3)
-                    return
-                } catch {
-                    log("\(dashboard) 反向连接 TCP\(port) 未能建立会话：\(error.localizedDescription)")
-                    socket.close()
-                }
-            }
-        }
     }
 
     private func isReadyLocked() -> Bool {
@@ -540,6 +491,10 @@ final class TailingConnection: @unchecked Sendable {
                     "encryptedHUID": signature.base64EncodedString(), "bluetoothName": "",
                     // 官方固定 true：仪表据此判断能否要求关键帧。
                     "supportH264IFrame": true,
+                    // 官方 DisplayService 在 reply 之前无条件塞这个键（DisplayService.java:2114），
+                    // 取值来自仪表上报的 supportSpeechEngine，默认 2。1.0.11 之前我们完全没发，
+                    // 是逐键比对里唯一「官方恒发、我方全缺」的字段。
+                    "speechEngineType": Int(uint64(object["supportSpeechEngine"]) ?? 2),
                     "appVersionFingerPrint": "iOS-\(phone.versionCode)"
                 ]
                 // 严格照官方 reply() 的二选一：仪表带 supportFunctionEx 时只回交集，
