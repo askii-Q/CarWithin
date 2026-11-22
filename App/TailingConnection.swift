@@ -432,8 +432,11 @@ final class TailingConnection: @unchecked Sendable {
                     throw TailingError.protocolFailure("目标报告台铃 TL-DASH-V2，请检查仪表配置")
                 }
                 if !isZeeho && name != "TL-DASH-V2" {
-                    // 二代仪表会报告不同 HUName；继续协商并记录，便于后续适配。
+                    // 二代仪表会报告不同 HUName；默认继续协商并记录，严格模式下按型号不符报错。
                     log("\(dashboard) 仪表报告 HUName=\(name.debugDescription)，不是已验证的 TL-DASH-V2；继续协商")
+                    if strictNegotiation {
+                        throw TailingError.protocolFailure("仪表型号校验失败：报告 \(name)，要求 TL-DASH-V2")
+                    }
                 }
                 condition.lock(); let identity = self.identity; condition.unlock()
                 guard let identity else { throw TailingError.closed }
