@@ -215,7 +215,16 @@ final class TailingConnection: @unchecked Sendable {
     }
 
     /// 只在首次请求失败后运行一次：记录仪表开放端口，并换端口尝试同样的请求。
+    /// 探测要扫 300 个端口，放到后台线程，避免拖住协商循环（关闭会话必须在 1 秒内返回）。
     private func probeAnnouncementPorts() {
+        DispatchQueue.global(qos: .utility).async { [self] in probeAnnouncementPortsNow() }
+    }
+
+    private func probeAnnouncementPortsNow() {
+        condition.lock()
+        let stopped = closed
+        condition.unlock()
+        if stopped { return }
         let range = TailingPorts.announcementProbeRange
         let reserved: Set<UInt16> = [ports.control, ports.auxiliary, ports.video]
         let candidates = range.filter { !reserved.contains($0) }
@@ -228,6 +237,10 @@ final class TailingConnection: @unchecked Sendable {
             guard (try? socket.connect(localIP: localIP, remoteIP: targetIP, port: port, timeout: 0.12)) != nil else { return }
             foundLock.lock(); found.append(port); foundLock.unlock()
         }
+        condition.lock()
+        let cancelled = closed
+        condition.unlock()
+        if cancelled { return }
         let openPorts = found.sorted()
         guard !openPorts.isEmpty else {
             log("\(dashboard) 端口探测 \(range.lowerBound)–\(range.upperBound)：仪表没有开放任何 TCP 端口")
