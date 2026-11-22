@@ -38,8 +38,6 @@ struct TailingPorts {
     var mediaControl: UInt16 = 10_921
     var mediaData: UInt16 = 10_920
     static let ios = TailingPorts(control: 10922, auxiliary: 10711, video: 10710, announcement: 10930)
-    /// 首次请求被拒绝时用于诊断与回退的探测范围。
-    static let announcementProbeRange: ClosedRange<UInt16> = 10_700...10_999
 }
 
 /// 官方 `ECP_C2P_CLIENT_INFO.reply()` 里 supportFunctionEx 回的是
@@ -60,7 +58,6 @@ final class TailingConnection: @unchecked Sendable {
     private let announcementRetryInterval: TimeInterval
     private let strictNegotiation: Bool
     private var announcementAttempts = 0
-    private var probedAnnouncementPorts = false
     private let identityProvider: () throws -> TailingIdentity
     private let log: (String) -> Void
     private let condition = NSCondition()
@@ -153,10 +150,6 @@ final class TailingConnection: @unchecked Sendable {
                 do { try announce() } catch { noteAnnouncementFailure(error) }
             }
             if Date() >= deadline {
-                if !probedAnnouncementPorts {
-                    probedAnnouncementPorts = true
-                    probeAnnouncementPorts()
-                }
                 condition.lock()
                 let progress = progressLocked()
                 condition.unlock()
@@ -208,59 +201,6 @@ final class TailingConnection: @unchecked Sendable {
             hint = "（连接被拒绝通常是仪表正被官方 App 占用）"
         }
         log("\(dashboard) 投屏请求失败：\(error.localizedDescription)\(hint)，会继续重试")
-        // 第一次被拒绝时探测仪表真正开放的端口，定位二代仪表改端口的情况。
-        guard !probedAnnouncementPorts else { return }
-        probedAnnouncementPorts = true
-        probeAnnouncementPorts()
-    }
-
-    /// 只在首次请求失败后运行一次：记录仪表开放端口，并换端口尝试同样的请求。
-    /// 探测要扫 300 个端口，放到后台线程，避免拖住协商循环（关闭会话必须在 1 秒内返回）。
-    private func probeAnnouncementPorts() {
-        DispatchQueue.global(qos: .utility).async { [self] in probeAnnouncementPortsNow() }
-    }
-
-    private func probeAnnouncementPortsNow() {
-        condition.lock()
-        let stopped = closed
-        condition.unlock()
-        if stopped { return }
-        let range = TailingPorts.announcementProbeRange
-        let reserved: Set<UInt16> = [ports.control, ports.auxiliary, ports.video]
-        let candidates = range.filter { !reserved.contains($0) }
-        var found: [UInt16] = []
-        let foundLock = NSLock()
-        DispatchQueue.concurrentPerform(iterations: candidates.count) { index in
-            let port = candidates[index]
-            guard let socket = try? TailingSocket.create() else { return }
-            defer { socket.close() }
-            guard (try? socket.connect(localIP: localIP, remoteIP: targetIP, port: port, timeout: 0.12)) != nil else { return }
-            foundLock.lock(); found.append(port); foundLock.unlock()
-        }
-        condition.lock()
-        let cancelled = closed
-        condition.unlock()
-        if cancelled { return }
-        let openPorts = found.sorted()
-        guard !openPorts.isEmpty else {
-            log("\(dashboard) 端口探测 \(range.lowerBound)–\(range.upperBound)：仪表没有开放任何 TCP 端口")
-            return
-        }
-        log("\(dashboard) 端口探测 \(range.lowerBound)–\(range.upperBound)：开放 \(openPorts.map { String($0) }.joined(separator: ", "))")
-        guard !openPorts.contains(ports.announcement) else { return }
-        for port in openPorts where !reserved.contains(port) {
-            guard let socket = try? TailingSocket.create() else { continue }
-            defer { socket.close() }
-            guard (try? socket.connect(localIP: localIP, remoteIP: targetIP, port: port, timeout: 0.5)) != nil,
-                  (try? socket.write(TailingProtocol.control(0x70000010, payload: TailingProtocol.json([
-                      "phoneType": "iOS", "packageName": phone.package
-                  ])))) != nil,
-                  let reply = try? TailingProtocol.readControl({ try socket.readExactly($0, timeout: 0.8) }),
-                  reply.command == 0x70000011 else { continue }
-            ports.announcement = port
-            log("\(dashboard) 改用投屏请求端口 \(port)（探测确认可协商）")
-            return
-        }
     }
 
     private func isReadyLocked() -> Bool {
