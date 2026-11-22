@@ -323,7 +323,7 @@ struct TailingTests {
         let identity = try TailingIdentity.generate()
         let connection = TailingConnection(localIP: "127.0.0.1", targetIP: "127.0.0.1", profile: .tailing43,
             phone: TailingPhoneInfo(package: "test.carwithin", versionCode: 2, model: "iPhone", systemVersion: "17", width: 1320, height: 2868, rotation: 0),
-            ports: ports, identityProvider: { identity }, log: { _ in })
+            ports: ports, identityProvider: { identity }, strictNegotiation: true, log: { _ in })
         defer { connection.close() }
         let done = DispatchGroup(); done.enter()
         DispatchQueue.global().async {
