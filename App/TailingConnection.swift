@@ -527,7 +527,11 @@ final class TailingConnection: @unchecked Sendable {
                     fields["supportFunctionEx"] = mask
                     log("\(dashboard) 仪表请求 supportFunctionEx=\(requested)，回应交集 \(mask)")
                 } else {
-                    fields["supportFunction"] = 128
+                    // 官方把仪表自己报的 supportFunction 原值回塞（ECP_C2P_CLIENT_INFO.process
+                    // 读入、reply 写回），不是固定值；写死一个常量会被仪表当成能力不匹配。
+                    let carMask = uint64(object["supportFunction"]) ?? 128
+                    fields["supportFunction"] = carMask
+                    if carMask != 128 { log("\(dashboard) 仪表报 supportFunction=\(carMask)，按原值回应") }
                 }
                 payload = try TailingProtocol.json(fields)
                 try replyControl(socket, request, payload: payload)
