@@ -32,12 +32,18 @@ jobs:
           PY
           for script in Tools/*.sh; do bash -n "$script"; echo "ok $script"; done
 
-      - name: 语法检查 App 与 Tools 源码
-        run: xcrun swiftc -parse App/*.swift Tools/*.swift
+      - name: 语法检查 App 源码
+        run: xcrun swiftc -parse App/*.swift
+
+      - name: 语法检查 Tools 脚本
+        run: for script in Tools/*.swift; do xcrun swiftc -parse "$script"; done
 
       - name: 构建并测试 TDSCarKitCore
         run: |
           swift test -c release --package-path . --scratch-path "$RUNNER_TEMP/tds-carkit-tests"
+
+      - name: 台铃与极核协议冒烟
+        run: bash Tools/test_tailing.sh
 
       - name: 工程生成脚本可运行
         run: |
