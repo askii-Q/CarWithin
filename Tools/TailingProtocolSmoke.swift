@@ -49,7 +49,7 @@ struct TailingTests {
         try simulatedInstrument(identity: stableIdentity, profile: .zeeho62)
         try rejectedInstrument()
         try cancelledHandshake()
-        print("PASS: 台铃拆包/合包、长度校验、RSA2048/type1、TCP取消、模拟仪表握手/逐帧拉取/保活/重启、错误型号拒绝、协商中停止")
+        print("PASS: 台铃拆包/合包、长度校验、RSA1024/type1、TCP取消、模拟仪表握手/逐帧拉取/保活/重启、错误型号拒绝、协商中停止")
     }
 
     private static func frames() throws {
@@ -86,7 +86,7 @@ struct TailingTests {
         try identity.verify(signature, huid: huid)
         try rejects("其他仪表身份") { try identity.verify(signature, huid: "OTHER") }
         let publicDER = try identity.publicKey()
-        try expect(publicDER.count == 294 && signature.count == 256, "iOS RSA2048/SPKI")
+        try expect(publicDER.count == 149 && signature.count == 128, "iOS RSA1024/SPKI")
         // 独立做公钥原始运算，验证真正的 type1 填充及原始 HUID，不能仅凭同算法自签自验。
         let publicKey = SecKeyCopyPublicKey(identity.key)!
         var error: Unmanaged<CFError>?

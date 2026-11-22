@@ -453,6 +453,7 @@ final class TailingConnection: @unchecked Sendable {
     private func control(_ socket: TailingSocket, firstResponseTimeout: TimeInterval? = nil) throws {
         var reverseStarted = false
         var reportedUnsupported = false
+        var frameLogBudget = 24
         // 反向探测时仪表未必会说话，首个消息头必须有超时，否则线程会一直挂着。
         var pendingFirstTimeout = firstResponseTimeout
         while true {
@@ -467,6 +468,11 @@ final class TailingConnection: @unchecked Sendable {
                 return try socket.readExactly(count, waitForFirstByte: readingHeader)
             }
             var payload = Data()
+            // 仪表只给了半句话就断开时，日志里至少要留下它说了什么。
+            if frameLogBudget > 0 {
+                frameLogBudget -= 1
+                log(String(format: "%@ ← 0x%08x（%d 字节）", dashboard, request.command, request.payload.count))
+            }
             switch request.command {
             case 0x10000:
                 // 官方实现在这里先回 0x10001 才继续等 CLIENT_INFO；不回的话仪表可能一直挂着。
@@ -509,7 +515,8 @@ final class TailingConnection: @unchecked Sendable {
                     "package": phone.package, "versionCode": phone.versionCode, "token": 0,
                     "pubkey": try identity.publicKey().base64EncodedString(),
                     "encryptedHUID": signature.base64EncodedString(), "bluetoothName": "",
-                    "supportH264IFrame": isZeeho, "mirrorRequestReconnect": true,
+                    // 官方固定 true：仪表据此判断能否要求关键帧。
+                    "supportH264IFrame": true,
                     "appVersionFingerPrint": "iOS-\(phone.versionCode)"
                 ]
                 // 官方 reply() 里 supportFunction 与 supportFunctionEx 二选一：仪表带
@@ -527,7 +534,7 @@ final class TailingConnection: @unchecked Sendable {
                 condition.lock()
                 self.huid = huid; signedHUID = signature; condition.broadcast()
                 condition.unlock()
-                log("仪表报告 HUName=\(name.debugDescription)，已回应本机 RSA2048 身份")
+                log("仪表报告 HUName=\(name.debugDescription)，已回应本机 RSA\(SecKeyGetBlockSize(identity.key) * 8) 身份（0x10011，\(payload.count) 字节）")
                 continue
             case 0x107c0:
                 // 官方在此之后把媒体通道切到 TLS（wrap(true)）。本实现只有明文通道，

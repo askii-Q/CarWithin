@@ -28,9 +28,14 @@ struct TailingIdentity {
                 [kSecAttrKeyType: kSecAttrKeyTypeRSA, kSecAttrKeyClass: kSecAttrKeyClassPrivate] as CFDictionary, &error) else {
                 throw error!.takeRetainedValue()
             }
-            return TailingIdentity(key: key, phoneID: id)
+            // 1.0.6 及更早版本存的是 RSA2048，官方是 RSA1024：尺寸不符就丢掉重来。
+            if SecKeyGetBlockSize(key) == 128 {
+                return TailingIdentity(key: key, phoneID: id)
+            }
+            SecItemDelete(query as CFDictionary)
+        } else if status != errSecItemNotFound {
+            throw TailingError.system("读取本机身份", status)
         }
-        guard status == errSecItemNotFound else { throw TailingError.system("读取本机身份", status) }
         let identity = try generate()
         var error: Unmanaged<CFError>?
         guard let bytes = SecKeyCopyExternalRepresentation(identity.key, &error) else { throw error!.takeRetainedValue() }
@@ -48,8 +53,11 @@ struct TailingIdentity {
 
     static func generate() throws -> TailingIdentity {
         var error: Unmanaged<CFError>?
+        // 官方 RSAUtil 生成的就是 1024 位（`keyPairGenerator.initialize(1024)`），
+        // 公钥与签名都以 base64 塞进 CLIENT_INFO 回包；位数放大到 2048 会让这一帧
+        // 从约 400 字符涨到约 800 字符，某些仪表固件按固定长度收包时会直接断链。
         guard let key = SecKeyCreateRandomKey([
-            kSecAttrKeyType: kSecAttrKeyTypeRSA, kSecAttrKeySizeInBits: 2048
+            kSecAttrKeyType: kSecAttrKeyTypeRSA, kSecAttrKeySizeInBits: 1024
         ] as CFDictionary, &error) else { throw error!.takeRetainedValue() }
         return TailingIdentity(key: key, phoneID: UUID().uuidString)
     }
