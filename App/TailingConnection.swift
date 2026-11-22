@@ -75,6 +75,8 @@ final class TailingConnection: @unchecked Sendable {
     private var mediaStarted = false
     private var configured = false
     private var movieMode = false
+    /// 仪表接受投屏请求后若不回连，只主动反向探测一轮，避免反复连接干扰它。
+    private var reverseProbeStarted = false
     private var isZeeho: Bool { profile.isZeeho }
     private var dashboard: String { profile.isZeeho ? "极核" : "台铃" }
 
@@ -147,7 +149,11 @@ final class TailingConnection: @unchecked Sendable {
             if ready { break }
             if Date() >= nextAttempt {
                 nextAttempt = Date().addingTimeInterval(announcementRetryInterval)
-                do { try announce() } catch { noteAnnouncementFailure(error) }
+                do {
+                    // 仪表一旦接受，就不再重复请求：反复 announce 会让它把每次请求当成新会话，
+                    // 实测表现为「每次都回 accepted，但一次也不回连」。被拒绝或连不上才重试。
+                    if try announce() { nextAttempt = deadline }
+                } catch { noteAnnouncementFailure(error) }
             }
             if Date() >= deadline {
                 condition.lock()
@@ -172,8 +178,9 @@ final class TailingConnection: @unchecked Sendable {
         log("\(dashboard) 媒体协商完成，等待仪表逐帧请求")
     }
 
-    /// 向仪表请求一次 iOS 投屏；失败由调用方记录并重试。
-    private func announce() throws {
+    /// 向仪表请求一次 iOS 投屏；失败由调用方记录并重试。返回仪表是否接受。
+    @discardableResult
+    private func announce() throws -> Bool {
         let socket = try tracked(TailingSocket.create())
         defer { socket.close() }
         do {
@@ -194,10 +201,12 @@ final class TailingConnection: @unchecked Sendable {
             accepted = status
         }
         if accepted {
-            log("\(dashboard) 仪表已接受 iOS 投屏请求（第 \(announcementAttempts) 次），等待其回连 \(localIP)")
+            log("\(dashboard) 仪表 \(targetIP)：\(ports.announcement) 已接受 iOS 投屏请求（第 \(announcementAttempts) 次），等待其回连 \(localIP)")
+            startReverseProbeIfNeeded()
         } else {
             log("\(dashboard) 仪表暂未接受 iOS 投屏请求，\(Int(announcementRetryInterval)) 秒后重试")
         }
+        return accepted
     }
 
     private func noteAnnouncementFailure(_ error: Error) {
@@ -206,6 +215,53 @@ final class TailingConnection: @unchecked Sendable {
             hint = "（连接被拒绝通常是仪表正被官方 App 占用）"
         }
         log("\(dashboard) 投屏请求失败：\(error.localizedDescription)\(hint)，会继续重试")
+    }
+
+    /// 仪表在「接受投屏请求」之后始终不回连时，反过来连它自己的同名端口。
+    /// 一半是诊断：把「仪表到底有没有在听这些端口」写进日志；
+    /// 一半是兜底：若对方先开口，就按会话控制通道继续协商。
+    private func startReverseProbeIfNeeded() {
+        // 图上作业/冒烟测试里 targetIP 就是本机，反向探测只会连到自己，直接跳过。
+        guard targetIP != localIP, targetIP != "127.0.0.1", targetIP != "localhost" else { return }
+        condition.lock()
+        let skip = reverseProbeStarted || closed
+        if !skip { reverseProbeStarted = true }
+        condition.unlock()
+        guard !skip else { return }
+        DispatchQueue.global(qos: .utility).async { [self] in
+            var candidates: [UInt16] = []
+            for port in [ports.control, ports.mediaControl, ports.auxiliary] where port != 0 {
+                if !candidates.contains(port) { candidates.append(port) }
+            }
+            for port in candidates {
+                condition.lock()
+                let stop = closed || signedHUID != nil
+                condition.unlock()
+                if stop { return }
+                let socket: TailingSocket
+                do { socket = try tracked(TailingSocket.create()) } catch { return }
+                do {
+                    try socket.connect(localIP: localIP, remoteIP: targetIP, port: port, timeout: 0.7)
+                } catch {
+                    log("\(dashboard) 反向探测 \(targetIP)：\(port) 不可连接（\(error.localizedDescription)）")
+                    socket.close()
+                    continue
+                }
+                guard !isMediaControlPort(port) else {
+                    log("\(dashboard) 反向探测 \(targetIP)：\(port)（\(portRole(port))）可连接，但反过来占用媒体控制通道不安全，仅记录")
+                    socket.close()
+                    continue
+                }
+                log("\(dashboard) 反向探测 \(targetIP)：\(port)（\(portRole(port))）可连接，等待仪表先说话")
+                do {
+                    try control(socket, firstResponseTimeout: 3)
+                    return
+                } catch {
+                    log("\(dashboard) 反向连接 TCP\(port) 未能建立会话：\(error.localizedDescription)")
+                    socket.close()
+                }
+            }
+        }
     }
 
     private func isReadyLocked() -> Bool {
@@ -360,14 +416,20 @@ final class TailingConnection: @unchecked Sendable {
         } catch { fail(error) }
     }
 
-    private func control(_ socket: TailingSocket) throws {
+    private func control(_ socket: TailingSocket, firstResponseTimeout: TimeInterval? = nil) throws {
         var reverseStarted = false
         var reportedUnsupported = false
+        // 反向探测时仪表未必会说话，首个消息头必须有超时，否则线程会一直挂着。
+        var pendingFirstTimeout = firstResponseTimeout
         while true {
             // 连接在两条完整消息之间可以静默，收到半条消息后仍限制读取时间。
             var readingHeader = true
             let request = try TailingProtocol.readControl { count in
                 defer { readingHeader = false }
+                if let timeout = pendingFirstTimeout {
+                    pendingFirstTimeout = nil
+                    return try socket.readExactly(count, timeout: timeout)
+                }
                 return try socket.readExactly(count, waitForFirstByte: readingHeader)
             }
             var payload = Data()
