@@ -538,16 +538,18 @@ final class TailingConnection: @unchecked Sendable {
                 // 官方 reply() 里 supportFunction 与 supportFunctionEx 二选一：仪表带
                 // supportFunctionEx 时只回交集，否则回 supportFunction。两个都发会让部分
                 // 固件走错分支，这里严格照官方行为分叉。
+                // 官方 reply() 在 isNewSupportFunction 为真时只写 supportFunctionEx；
+                // 但固件解析器只要漏读一个键就会把这段回包判为无效（1.0.8 实测：回
+                // Ex=0 被立刻 RST）。这里两个键同时给：supportFunction 回塞仪表原值，
+                // supportFunctionEx 给能力交集，任一解析路径都能拿到完整能力表。
+                let carMask = uint64(object["supportFunction"]) ?? 128
+                fields["supportFunction"] = carMask
                 if let requested = uint64(object["supportFunctionEx"]) {
                     let mask = TailingCapabilities.exclusive & requested
                     fields["supportFunctionEx"] = mask
-                    log("\(dashboard) 仪表请求 supportFunctionEx=\(requested)，回应交集 \(mask)")
-                } else {
-                    // 官方把仪表自己报的 supportFunction 原值回塞（ECP_C2P_CLIENT_INFO.process
-                    // 读入、reply 写回），不是固定值；写死一个常量会被仪表当成能力不匹配。
-                    let carMask = uint64(object["supportFunction"]) ?? 128
-                    fields["supportFunction"] = carMask
-                    if carMask != 128 { log("\(dashboard) 仪表报 supportFunction=\(carMask)，按原值回应") }
+                    log("\(dashboard) 仪表报 supportFunction=\(carMask)、supportFunctionEx=\(requested)，回应交集 \(mask)")
+                } else if carMask != 128 {
+                    log("\(dashboard) 仪表报 supportFunction=\(carMask)，按原值回应")
                 }
                 payload = try TailingProtocol.json(fields)
                 // 把双向 JSON 都留在日志里：下一轮不用再猜，直接比对字段。

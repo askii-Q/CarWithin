@@ -174,7 +174,7 @@ struct TailingTests {
                 let exFields = try TailingProtocol.object(exReply.payload)
                 try expect(exReply.command == 0x10011 && exFields["supportFunctionEx"] as? UInt64 == 12,
                            "仪表带 supportFunctionEx 时回 0xFFBFFFDF 与请求值的交集")
-                try expect(exFields["supportFunction"] == nil, "两个能力字段不能同时出现")
+                try expect(exFields["supportFunction"] as? UInt64 == 12, "supportFunction 仍需回塞仪表原值")
                 if isZeeho {
                     let speed = try TailingProtocol.json(["wifiSpeed": 0, "usbSpeed": 0])
                     try primary.write(TailingProtocol.control(0x10690, identifier: 20, payload: speed))
