@@ -88,7 +88,7 @@ One instrument was tested with repeated backgrounding and screen locks. Perceive
 
 ### Tailing 4.3-inch display
 
-This mode targets the **TL-DASH-V2** instrument display. Other models and firmware still need testing.
+**TL-DASH-V2** is the verified instrument display; other Tailing models and firmware, including 苍穹 II, still need confirmation.
 
 1. Connect the iPhone to the instrument's Wi-Fi and enter that network's credentials in Wi-Fi and network.
 2. Select Tailing 4.3-inch under Current output. The instrument IP defaults to `192.168.1.1`; change it under Output settings if needed.

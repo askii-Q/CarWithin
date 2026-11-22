@@ -2608,10 +2608,10 @@ extension ReceiverViewController {
 
     private func tailingOutputSections() -> [SettingsSection] {
         [
-            SettingsSection("台铃 4.3 寸", footer: "适用于 TL-DASH-V2 仪表。iPhone 加入仪表 Wi-Fi，在「Wi-Fi 与网络」填写该网络信息；开启仪表投屏后启动 CarPlay。请先退出其他投屏 App。", [
+            SettingsSection("台铃 4.3 寸", footer: "已验证 TL-DASH-V2 仪表。iPhone 加入仪表 Wi-Fi，在「Wi-Fi 与网络」填写该网络信息，再启动 CarPlay；App 会连续请求仪表回连约 60 秒，这段时间在仪表上打开投屏即可。请先退出官方投屏 App，官方投屏占用时仪表会拒绝连接。苍穹 II 等其他型号会按同样流程尝试，但尚未验证。", [
                 .field("仪表 IP 地址", tailingAddressField, placeholder: "192.168.1.1")
             ]),
-            SettingsSection(footer: "仪表输出固定为 480×272、JPEG，最高 20 FPS。本机 CarPlay 使用 H.264、960×544、30 FPS。声音由 iPhone／蓝牙输出；仪表不回传触控。", [.note(tailingStatus)])
+            SettingsSection(footer: "仪表输出固定为 480×272、JPEG，最高 20 FPS。本机 CarPlay 使用 H.264、960×544、30 FPS。声音由 iPhone／蓝牙输出；仪表不回传触控。日志里出现「仍在等待仪表回连」时，先退出仪表上的官方投屏，再重新打开投屏。", [.note(tailingStatus)])
         ]
     }
 

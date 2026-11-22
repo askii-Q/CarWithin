@@ -30,8 +30,11 @@ struct TailingPorts {
     let control: UInt16
     let auxiliary: UInt16
     let video: UInt16
-    let announcement: UInt16
+    /// 未验证型号可能把投屏请求端口放在别处，协商期允许改写。
+    var announcement: UInt16
     static let ios = TailingPorts(control: 10922, auxiliary: 10711, video: 10710, announcement: 10930)
+    /// 首次请求被拒绝时用于诊断与回退的探测范围。
+    static let announcementProbeRange: ClosedRange<UInt16> = 10_700...10_999
 }
 
 /// 台铃 JPEG 和极核 H.264 共用的 PXC 投屏会话。
@@ -40,7 +43,12 @@ final class TailingConnection: @unchecked Sendable {
     private let targetIP: String
     private let profile: TailingDisplayProfile
     private let phone: TailingPhoneInfo
-    private let ports: TailingPorts
+    private var ports: TailingPorts
+    private let negotiationTimeout: TimeInterval
+    private let announcementRetryInterval: TimeInterval
+    private let strictNegotiation: Bool
+    private var announcementAttempts = 0
+    private var probedAnnouncementPorts = false
     private let identityProvider: () throws -> TailingIdentity
     private let log: (String) -> Void
     private let condition = NSCondition()
@@ -62,9 +70,14 @@ final class TailingConnection: @unchecked Sendable {
 
     init(localIP: String, targetIP: String, profile: TailingDisplayProfile, phone: TailingPhoneInfo,
          ports: TailingPorts = .ios, identityProvider: @escaping () throws -> TailingIdentity = TailingIdentity.load,
+         negotiationTimeout: TimeInterval = 60, announcementRetryInterval: TimeInterval = 6,
+         strictNegotiation: Bool = UserDefaults.standard.bool(forKey: "tailingStrictNegotiation"),
          log: @escaping (String) -> Void) {
         self.localIP = localIP; self.targetIP = targetIP; self.profile = profile; self.phone = phone
         self.ports = ports; self.identityProvider = identityProvider; self.log = log
+        self.negotiationTimeout = negotiationTimeout
+        self.announcementRetryInterval = announcementRetryInterval
+        self.strictNegotiation = strictNegotiation
     }
 
     func start() throws {
@@ -81,25 +94,134 @@ final class TailingConnection: @unchecked Sendable {
             DispatchQueue.global(qos: .userInitiated).async { [self] in accept(server, port: port) }
         }
         log("\(dashboard) TCP 已监听 \(localIP):\(ports.control)/\(ports.auxiliary)/\(ports.video)，正在协商")
-        let announcement = try tracked(TailingSocket.create())
-        defer { announcement.close() }
-        try announcement.connect(localIP: localIP, remoteIP: targetIP, port: ports.announcement)
-        try announcement.write(TailingProtocol.control(0x70000010, payload: TailingProtocol.json([
+        // 仪表可能晚于本机进入投屏状态，也可能正被官方 App 占用而短暂拒绝连接。
+        // 协商窗口内持续重发投屏请求，任意一次成功即可，而不是一次失败就结束会话。
+        let deadline = Date().addingTimeInterval(negotiationTimeout)
+        var nextAttempt = Date.distantPast
+        var lastProgressLog = Date()
+        while true {
+            condition.lock()
+            let stopped = closed
+            let pendingFailure = failure
+            let ready = isReadyLocked()
+            condition.unlock()
+            // 先报真正的失败原因：fail() 会先记录 failure 再关闭会话。
+            if let pendingFailure { throw pendingFailure }
+            if stopped { throw TailingError.closed }
+            if ready { break }
+            if Date() >= nextAttempt {
+                nextAttempt = Date().addingTimeInterval(announcementRetryInterval)
+                do { try announce() } catch { noteAnnouncementFailure(error) }
+            }
+            if Date() >= deadline {
+                if !probedAnnouncementPorts {
+                    probedAnnouncementPorts = true
+                    probeAnnouncementPorts()
+                }
+                condition.lock()
+                let progress = progressLocked()
+                condition.unlock()
+                throw TailingError.timeout("等待仪表回连超时（\(Int(negotiationTimeout)) 秒）：\(progress)。请先退出仪表上的官方投屏，再重新开启投屏，并保持本页不动")
+            }
+            condition.lock()
+            _ = condition.wait(until: min(deadline, nextAttempt))
+            let progress = progressLocked()
+            condition.unlock()
+            if Date().timeIntervalSince(lastProgressLog) >= 10 {
+                lastProgressLog = Date()
+                log("\(dashboard) 仍在等待仪表回连：\(progress)")
+            }
+        }
+        log("\(dashboard) 媒体协商完成，等待仪表逐帧请求")
+    }
+
+    /// 向仪表请求一次 iOS 投屏；失败由调用方记录并重试。
+    private func announce() throws {
+        let socket = try tracked(TailingSocket.create())
+        defer { socket.close() }
+        do {
+            try socket.connect(localIP: localIP, remoteIP: targetIP, port: ports.announcement)
+        } catch {
+            throw TailingError.channel("连接仪表投屏端口 TCP\(ports.announcement)", error)
+        }
+        try socket.write(TailingProtocol.control(0x70000010, payload: TailingProtocol.json([
             "phoneType": "iOS", "packageName": phone.package
         ])))
-        let reply = try TailingProtocol.readControl { try announcement.readExactly($0, timeout: 3) }
-        guard reply.command == 0x70000011,
-              try TailingProtocol.object(reply.payload)["status"] as? Bool == true else {
-            throw TailingError.protocolFailure("仪表未接受 iOS 投屏请求")
+        let reply = try TailingProtocol.readControl { try socket.readExactly($0, timeout: 3) }
+        guard reply.command == 0x70000011 else {
+            throw TailingError.protocolFailure(String(format: "仪表回应 0x%08x，预期 0x70000011", reply.command))
         }
-        let deadline = Date().addingTimeInterval(20)
-        condition.lock()
-        defer { condition.unlock() }
-        while !closed && failure == nil && (signedHUID == nil || video == nil || !mediaStarted || (isZeeho && reverseControl == nil)) {
-            if !condition.wait(until: deadline) { throw TailingError.timeout("媒体会话未就绪，请退出官方投屏并重新开启仪表投屏") }
+        announcementAttempts += 1
+        var accepted = false
+        if let object = try? TailingProtocol.object(reply.payload), let status = object["status"] as? Bool {
+            accepted = status
         }
-        try checkLocked()
-        log("\(dashboard) 媒体协商完成，等待仪表逐帧请求")
+        if accepted {
+            log("\(dashboard) 仪表已接受 iOS 投屏请求（第 \(announcementAttempts) 次），等待其回连 \(localIP)")
+        } else {
+            log("\(dashboard) 仪表暂未接受 iOS 投屏请求，\(Int(announcementRetryInterval)) 秒后重试")
+        }
+    }
+
+    private func noteAnnouncementFailure(_ error: Error) {
+        var hint = ""
+        if let tailing = error as? TailingError, case .channel = tailing {
+            hint = "（连接被拒绝通常是仪表正被官方 App 占用）"
+        }
+        log("\(dashboard) 投屏请求失败：\(error.localizedDescription)\(hint)，会继续重试")
+        // 第一次被拒绝时探测仪表真正开放的端口，定位二代仪表改端口的情况。
+        guard !probedAnnouncementPorts else { return }
+        probedAnnouncementPorts = true
+        probeAnnouncementPorts()
+    }
+
+    /// 只在首次请求失败后运行一次：记录仪表开放端口，并换端口尝试同样的请求。
+    private func probeAnnouncementPorts() {
+        let range = TailingPorts.announcementProbeRange
+        let reserved: Set<UInt16> = [ports.control, ports.auxiliary, ports.video]
+        let candidates = range.filter { !reserved.contains($0) }
+        var found: [UInt16] = []
+        let foundLock = NSLock()
+        DispatchQueue.concurrentPerform(iterations: candidates.count) { index in
+            let port = candidates[index]
+            guard let socket = try? TailingSocket.create() else { return }
+            defer { socket.close() }
+            guard (try? socket.connect(localIP: localIP, remoteIP: targetIP, port: port, timeout: 0.12)) != nil else { return }
+            foundLock.lock(); found.append(port); foundLock.unlock()
+        }
+        let openPorts = found.sorted()
+        guard !openPorts.isEmpty else {
+            log("\(dashboard) 端口探测 \(range.lowerBound)–\(range.upperBound)：仪表没有开放任何 TCP 端口")
+            return
+        }
+        log("\(dashboard) 端口探测 \(range.lowerBound)–\(range.upperBound)：开放 \(openPorts.map { String($0) }.joined(separator: ", "))")
+        guard !openPorts.contains(ports.announcement) else { return }
+        for port in openPorts where !reserved.contains(port) {
+            guard let socket = try? TailingSocket.create() else { continue }
+            defer { socket.close() }
+            guard (try? socket.connect(localIP: localIP, remoteIP: targetIP, port: port, timeout: 0.5)) != nil,
+                  (try? socket.write(TailingProtocol.control(0x70000010, payload: TailingProtocol.json([
+                      "phoneType": "iOS", "packageName": phone.package
+                  ])))) != nil,
+                  let reply = try? TailingProtocol.readControl({ try socket.readExactly($0, timeout: 0.8) }),
+                  reply.command == 0x70000011 else { continue }
+            ports.announcement = port
+            log("\(dashboard) 改用投屏请求端口 \(port)（探测确认可协商）")
+            return
+        }
+    }
+
+    private func isReadyLocked() -> Bool {
+        signedHUID != nil && video != nil && mediaStarted && (!isZeeho || reverseControl != nil)
+    }
+
+    private func progressLocked() -> String {
+        var parts: [String] = []
+        parts.append(signedHUID == nil ? "会话控制未回连" : "会话控制已回连")
+        parts.append(video == nil ? "视频通道未回连" : "视频通道已回连")
+        parts.append(mediaStarted ? "媒体已启动" : "媒体未启动")
+        if isZeeho { parts.append(reverseControl == nil ? "镜像通道未就绪" : "镜像通道已就绪") }
+        return parts.joined(separator: "、")
     }
 
     @discardableResult
@@ -260,7 +382,8 @@ final class TailingConnection: @unchecked Sendable {
                     throw TailingError.protocolFailure("目标报告台铃 TL-DASH-V2，请检查仪表配置")
                 }
                 if !isZeeho && name != "TL-DASH-V2" {
-                    throw TailingError.protocolFailure("目标能力不是已支持的 TL-DASH-V2")
+                    // 二代仪表会报告不同 HUName；继续协商并记录，便于后续适配。
+                    log("\(dashboard) 仪表报告 HUName=\(name.debugDescription)，不是已验证的 TL-DASH-V2；继续协商")
                 }
                 condition.lock(); let identity = self.identity; condition.unlock()
                 guard let identity else { throw TailingError.closed }
@@ -297,7 +420,12 @@ final class TailingConnection: @unchecked Sendable {
             case 0x20021, 0x20031, 0x204c1, 0x20491, 0x20051, 0x20591, 0x205a1, 0x70000001:
                 continue // 回应不再回应，避免往返循环。
             default:
-                throw TailingError.protocolFailure(String(format: "未支持的协商命令 0x%08x", request.command))
+                // 新固件可能新增协商命令；未知命令记录后继续，避免整场会话直接中断。
+                log(String(format: "%@ 会话控制收到未支持的命令 0x%08x（%d 字节）", dashboard, request.command, request.payload.count))
+                if strictNegotiation {
+                    throw TailingError.protocolFailure(String(format: "未支持的协商命令 0x%08x", request.command))
+                }
+                continue
             }
             try replyControl(socket, request, payload: payload)
             if request.command == 0x20000 && !reverseStarted {
@@ -379,8 +507,12 @@ final class TailingConnection: @unchecked Sendable {
                 let height = request.payload.uint16LE(2)
                 let validDimensions = isZeeho ? width == 1024 && (height == 480 || height == 488)
                     : width == 480 && height == 272
-                guard validDimensions else {
-                    throw TailingError.protocolFailure("仪表媒体尺寸 \(width)×\(height) 与 \(dashboard) 配置不符")
+                if !validDimensions {
+                    // 未验证型号（如二代仪表）可能请求其他尺寸；先按已验证尺寸回话并记录。
+                    log("\(dashboard) 仪表请求媒体尺寸 \(width)×\(height)，与已验证的 \(profile.width)×\(profile.height) 不同；按已验证尺寸回话")
+                    if strictNegotiation {
+                        throw TailingError.protocolFailure("仪表媒体尺寸 \(width)×\(height) 与 \(dashboard) 配置不符")
+                    }
                 }
                 let deadline = Date().addingTimeInterval(5)
                 condition.lock()

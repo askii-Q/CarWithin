@@ -72,9 +72,14 @@ final class TailingOutputSession: @unchecked Sendable {
 
     init(localAddress: String, targetAddress: String, phone: TailingPhoneInfo, log: @escaping (String) -> Void,
          ports: TailingPorts = .ios, identityProvider: @escaping () throws -> TailingIdentity = TailingIdentity.load) {
+        // 未验证型号若把投屏请求端口放在别处，可在调试时用 UserDefaults 键
+        // tailingAnnouncementPort 覆盖，无需改代码即可实机确认。
+        var resolved = ports
+        let override = UserDefaults.standard.integer(forKey: "tailingAnnouncementPort")
+        if (1...65_535).contains(override) { resolved.announcement = UInt16(override) }
         // TailingConnection invokes log from its own socket workers.
         connection = TailingConnection(localIP: localAddress, targetIP: targetAddress,
-            profile: .tailing43, phone: phone, ports: ports, identityProvider: identityProvider, log: log)
+            profile: .tailing43, phone: phone, ports: resolved, identityProvider: identityProvider, log: log)
     }
 
     var isClosed: Bool { condition.lock(); defer { condition.unlock() }; return closed }
