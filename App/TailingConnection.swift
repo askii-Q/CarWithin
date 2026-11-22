@@ -259,7 +259,12 @@ final class TailingConnection: @unchecked Sendable {
                 do {
                     try control(socket, firstResponseTimeout: 20)
                 } catch {
-                    log("\(dashboard) 请求通道在 20 秒内没有后续交互：\(error.localizedDescription)")
+                    // 仪表接受请求后通常会立刻关掉这条通道，再单独回连 10922；这不是错误。
+                    if let tailing = error as? TailingError, case .closed = tailing {
+                        log("\(dashboard) 仪表已关闭请求通道（正常，回连走会话控制端口）")
+                    } else {
+                        log("\(dashboard) 请求通道结束：\(error.localizedDescription)")
+                    }
                     socket.close()
                 }
             }
@@ -501,6 +506,8 @@ final class TailingConnection: @unchecked Sendable {
         var reverseStarted = false
         var reportedUnsupported = false
         var frameLogBudget = 24
+        // 仪表断开离上一帧有多近，是判断「它压根没读回包」还是「读完回包才拒绝」的唯一依据。
+        var lastFrameAt: Date?
         // 反向探测时仪表未必会说话，首个消息头必须有超时，否则线程会一直挂着。
         var pendingFirstTimeout = firstResponseTimeout
         while true {
@@ -521,24 +528,32 @@ final class TailingConnection: @unchecked Sendable {
                 let answeredIdentity = signedHUID != nil
                 condition.unlock()
                 if answeredIdentity {
-                    throw TailingError.channel("仪表在收到 0x10011 后主动断开（身份或能力字段不被接受）", error)
+                    // 距上一帧极短（几毫秒）说明仪表是读完 0x10011 立刻复位，而不是等我们超时。
+                    let gap = lastFrameAt.map { String(format: "，距上一帧 %.0f ms", Date().timeIntervalSince($0) * 1_000) } ?? ""
+                    throw TailingError.channel("仪表在收到 0x10011 后主动断开（身份或能力字段不被接受\(gap)）", error)
                 }
                 throw error
             }
+            lastFrameAt = Date()
             var payload = Data()
             // 仪表只给了半句话就断开时，日志里至少要留下它说了什么。
             if frameLogBudget > 0 {
                 frameLogBudget -= 1
-                log(String(format: "%@ ← 0x%08x（%d 字节）", dashboard, request.command, request.payload.count))
+                // 第 12..15 字节（identifier/token）到底是不是 0，直接决定响应该回显还是清零。
+                log(String(format: "%@ ← 0x%08x（%d 字节，token=0x%08x）",
+                           dashboard, request.command, request.payload.count, request.identifier))
             }
             switch request.command {
             case 0x10000:
                 // 官方实现在这里先回 0x10001 才继续等 CLIENT_INFO；不回的话仪表可能一直挂着。
-                try socket.write(TailingProtocol.control(0x10001, identifier: request.identifier))
+                // 响应帧第 12..15 字节恒为 0：ridedaemon 的 Go 实现（hud/net/pxc.go）所有响应都写
+                // "Padding is always 0 for responses"；安卓端是复用请求头对象顺带回显。先按 0 发，
+                // 请求里的原值只记日志，用来确认仪表究竟发的是什么。
+                try socket.write(TailingProtocol.control(0x10001, identifier: 0))
             case 0x20000:
-                try socket.write(TailingProtocol.control(0x20001, identifier: request.identifier))
+                try socket.write(TailingProtocol.control(0x20001, identifier: 0))
             case 0x30000:
-                try socket.write(TailingProtocol.control(0x30001, identifier: request.identifier))
+                try socket.write(TailingProtocol.control(0x30001, identifier: 0))
             case 0x10740, 0x10040, 0x70000000:
                 break
             case 0x10690 where isZeeho, 0x10780 where isZeeho:
