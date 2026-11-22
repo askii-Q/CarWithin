@@ -74,25 +74,34 @@ struct TailingIdentity {
         return Self.der(0x30, algorithm + bitString)
     }
 
+    /// 生成 `encryptedHUID`。
+    ///
+    /// 官方 `RSAUtil.encryptHUID()` 是 `Cipher(DECRYPT_MODE, 私钥)`，也就是对 HUID 原文做
+    /// `m = padding(HUID)`、`c = m^d mod n`。仪表侧验证时用我们的公钥做 `c^e mod n` 还原原文。
+    /// 这条路我们完全可以用公钥正向算：`SecKeyCreateEncryptedData(pub, .rsaEncryptionPKCS1, HUID)`
+    /// 的结果与仪表侧 `c^e mod n` 完全等价，而且不依赖 `SecKeyCreateSignature` 的填充语义
+    /// （1.0.9 实车回包用 `.rsaSignatureDigestPKCS1v15Raw` 生成，离线用公钥还原出来是乱码，
+    /// 说明那套签名路径与导出的公钥并不自洽）。
     func sign(_ huid: String) throws -> Data {
         let message = Data(huid.utf8)
         guard !message.isEmpty, message.count <= SecKeyGetBlockSize(key) - 11 else {
             throw TailingError.protocolFailure("仪表身份长度异常")
         }
-        // 协议是原始 HUID 加 PKCS#1 type 1 填充，不是 SHA 摘要签名。
+        guard let publicKey = SecKeyCopyPublicKey(key) else {
+            throw TailingError.protocolFailure("本机公钥缺失")
+        }
         var error: Unmanaged<CFError>?
-        guard let signature = SecKeyCreateSignature(key, .rsaSignatureDigestPKCS1v15Raw, message as CFData, &error) else {
+        guard let cipher = SecKeyCreateEncryptedData(publicKey, .rsaEncryptionPKCS1, message as CFData, &error) else {
             throw error!.takeRetainedValue()
         }
-        return signature as Data
+        return cipher as Data
     }
 
+    /// 用私钥把密文还原，验证它与 HUID 原文一致。仪表回显的正是这段密文本身。
     func verify(_ signature: Data, huid: String) throws {
-        guard let publicKey = SecKeyCopyPublicKey(key) else { throw TailingError.protocolFailure("本机公钥缺失") }
-        let message = Data(huid.utf8)
         var error: Unmanaged<CFError>?
-        guard SecKeyVerifySignature(publicKey, .rsaSignatureDigestPKCS1v15Raw,
-                                   message as CFData, signature as CFData, &error) else {
+        guard let plain = SecKeyCreateDecryptedData(key, .rsaEncryptionPKCS1, signature as CFData, &error),
+              plain as Data == Data(huid.utf8) else {
             throw TailingError.protocolFailure("媒体通道身份回显校验失败")
         }
     }

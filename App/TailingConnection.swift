@@ -524,6 +524,13 @@ final class TailingConnection: @unchecked Sendable {
                 condition.lock(); let identity = self.identity; condition.unlock()
                 guard let identity else { throw TailingError.closed }
                 let signature = try identity.sign(huid)
+                // 先在设备上自证：密文用私钥还原必须等于 HUID。日志里留一行，免得再靠实车猜。
+                do {
+                    try identity.verify(signature, huid: huid)
+                    log("\(dashboard) 身份密文自检通过（\(signature.count) 字节，私钥还原与 HUID 一致）")
+                } catch {
+                    log("\(dashboard) 身份密文自检失败：\(error)")
+                }
                 var fields: [String: Any] = [
                     "pxcVersion": "1.0.2", "phoneUUID": identity.phoneID,
                     "phoneBrand": "iPhone", "phoneModel": phone.model,
