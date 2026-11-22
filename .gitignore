@@ -37,3 +37,4 @@ __pycache__/
 # Local analysis artifacts
 analysis/
 reference/
+nohup.out
