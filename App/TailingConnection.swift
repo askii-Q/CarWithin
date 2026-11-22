@@ -9,6 +9,21 @@ struct TailingDisplayProfile {
 
 import Foundation
 
+/// 0x10011 身份回包里可替换的字段：仪表若在收到回包后立刻断链，说明它对某个取值不满意。
+/// 帧格式、加密方式和字段名都与官方一致（已逐项比对 `ECP_C2P_CLIENT_INFO.reply()`），
+/// 剩下的变量只有这些取值，所以按「变体」整组替换，一次装机能自动把所有组合试一遍。
+struct TailingHandshakeVariant {
+    let name: String
+    let package: String
+    let brand: String
+    let model: String
+    let osVersion: String
+    let os: String
+    let versionCode: Int
+    let token: Int
+    let fingerprint: String
+}
+
 struct TailingPhoneInfo {
     let package: String
     let versionCode: Int
@@ -80,7 +95,9 @@ final class TailingConnection: @unchecked Sendable {
     private var mediaStarted = false
     private var configured = false
     private var movieMode = false
-    /// 仪表接受投屏请求后若不回连，只主动反向探测一轮，避免反复连接干扰它。
+    /// 仪表在 0x10011 之后立刻断链时，换成下一个身份变体重新请求，而不是整场会话直接失败。
+    private var variantIndex = 0
+    private var reannounceRequested = false
     private var isZeeho: Bool { profile.isZeeho }
     private var dashboard: String { profile.isZeeho ? "极核" : "台铃" }
 
@@ -157,7 +174,7 @@ final class TailingConnection: @unchecked Sendable {
         }
         // 仪表可能晚于本机进入投屏状态，也可能正被官方 App 占用而短暂拒绝连接。
         // 协商窗口内持续重发投屏请求，任意一次成功即可，而不是一次失败就结束会话。
-        let deadline = Date().addingTimeInterval(negotiationTimeout)
+        var deadline = Date().addingTimeInterval(negotiationTimeout)
         var nextAttempt = Date.distantPast
         var lastProgressLog = Date()
         while true {
@@ -191,8 +208,18 @@ final class TailingConnection: @unchecked Sendable {
             if cancelledNow { throw TailingError.closed }
             condition.lock()
             _ = condition.wait(until: min(deadline, nextAttempt))
+            let retryWithNext = reannounceRequested
+            if retryWithNext { reannounceRequested = false }
             let progress = progressLocked()
             condition.unlock()
+            if retryWithNext {
+                // 仪表拒绝了当前身份：立刻换下一个变体重新请求，不必等满重试间隔，也不再受
+                // 原来的 60 秒窗口限制——每次换变体都要给它一次完整的协商时间。
+                deadline = Date().addingTimeInterval(min(negotiationTimeout, 20))
+                nextAttempt = Date.distantPast
+                log("\(dashboard) \(progress)；用「\(currentHandshakeVariant.name)」重新请求投屏")
+                continue
+            }
             if Date().timeIntervalSince(lastProgressLog) >= 10 {
                 lastProgressLog = Date()
                 log("\(dashboard) 仍在等待仪表回连：\(progress)")
@@ -252,6 +279,66 @@ final class TailingConnection: @unchecked Sendable {
 
     private func isReadyLocked() -> Bool {
         signedHUID != nil && video != nil && mediaStarted && (!isZeeho || reverseControl != nil)
+    }
+
+    /// 0x10011 的可替换取值。官方 `reply()` 里这些字段的来源分别是
+    /// `Build.BRAND/MODEL/VERSION.SDK_INT`、`AppUtil.getFormatOsName()`（"Android"）、
+    /// `AppUtil.getPackageName()`、`getAppVersionCode()`、`PXCService.tokenTls`、
+    /// `getAboutVersionInfo()`（`V:<versionName>(<code>)-<hash>-<env>`），
+    /// 这里整套给出，便于仪表按自己的规则挑选。
+    private var handshakeVariants: [TailingHandshakeVariant] {
+        [
+            TailingHandshakeVariant(
+                name: "V1 本机 iOS 身份", package: phone.package, brand: "iPhone",
+                model: phone.model, osVersion: phone.systemVersion, os: "iOS",
+                versionCode: phone.versionCode, token: 0,
+                fingerprint: "iOS-\(phone.versionCode)"),
+            TailingHandshakeVariant(
+                name: "V2 iOS 身份 + 台铃包名", package: "com.tailg.run.intelligence", brand: "iPhone",
+                model: phone.model, osVersion: phone.systemVersion, os: "iOS",
+                versionCode: phone.versionCode, token: 0,
+                fingerprint: "iOS-\(phone.versionCode)"),
+            TailingHandshakeVariant(
+                name: "V3 安卓身份 + 台铃包名", package: "com.tailg.run.intelligence", brand: "Xiaomi",
+                model: "MI 8", osVersion: "33", os: "Android",
+                versionCode: 1_030, token: 202_311_16,
+                fingerprint: "V:1.2.6(1030)-0-1"),
+            TailingHandshakeVariant(
+                name: "V4 iOS 身份 + 非零 token", package: phone.package, brand: "iPhone",
+                model: phone.model, osVersion: phone.systemVersion, os: "iOS",
+                versionCode: phone.versionCode, token: 202_311_16,
+                fingerprint: "iOS-\(phone.versionCode)")
+        ]
+    }
+
+    private var currentHandshakeVariant: TailingHandshakeVariant {
+        let variants = handshakeVariants
+        return variants[min(variantIndex, variants.count - 1)]
+    }
+
+    /// 仪表读完 0x10011 就断开时，换下一个身份变体重新投屏；返回 true 表示已安排重试。
+    private func retryWithNextHandshakeVariant(after error: Error) -> Bool {
+        condition.lock()
+        let answered = signedHUID != nil
+        let canRetry = answered && !closed && failure == nil && variantIndex + 1 < handshakeVariants.count
+        if !canRetry {
+            let exhausted = answered && !closed && failure == nil
+            condition.unlock()
+            if exhausted {
+                log("\(dashboard) 所有身份变体都被仪表拒绝（V1–V\(handshakeVariants.count)），不再重试")
+            }
+            return false
+        }
+        let rejected = currentHandshakeVariant
+        variantIndex += 1
+        let next = currentHandshakeVariant
+        // 清掉已回应的身份，让 start() 的等待循环重新进入协商，aux 通道也会重新等回包。
+        signedHUID = nil
+        reannounceRequested = true
+        condition.broadcast()
+        condition.unlock()
+        log("\(dashboard) 身份变体「\(rejected.name)」被仪表拒绝（\(error.localizedDescription)），改为「\(next.name)」重新请求投屏")
+        return true
     }
 
     private func progressLocked() -> String {
@@ -398,7 +485,11 @@ final class TailingConnection: @unchecked Sendable {
                 } else {
                     DispatchQueue.global(qos: .userInitiated).async { [self] in
                         do { try control(socket) } catch {
-                            fail(TailingError.channel("会话控制 TCP\(port)", error))
+                            socket.close()
+                            // 仪表读完 0x10011 就断开时，先换身份变体重试；全部试过才报错。
+                            if !retryWithNextHandshakeVariant(after: error) {
+                                fail(TailingError.channel("会话控制 TCP\(port)", error))
+                            }
                         }
                     }
                 }
@@ -482,11 +573,12 @@ final class TailingConnection: @unchecked Sendable {
                 } catch {
                     log("\(dashboard) 身份签名自检失败：\(error)")
                 }
+                let variant = currentHandshakeVariant
                 var fields: [String: Any] = [
                     "pxcVersion": "1.0.2", "phoneUUID": identity.phoneID,
-                    "phoneBrand": "iPhone", "phoneModel": phone.model,
-                    "phoneOsVersion": phone.systemVersion, "phoneOs": "iOS",
-                    "package": phone.package, "versionCode": phone.versionCode, "token": 0,
+                    "phoneBrand": variant.brand, "phoneModel": variant.model,
+                    "phoneOsVersion": variant.osVersion, "phoneOs": variant.os,
+                    "package": variant.package, "versionCode": variant.versionCode, "token": variant.token,
                     "pubkey": try identity.publicKey().base64EncodedString(),
                     "encryptedHUID": signature.base64EncodedString(), "bluetoothName": "",
                     // 官方固定 true：仪表据此判断能否要求关键帧。
@@ -495,7 +587,7 @@ final class TailingConnection: @unchecked Sendable {
                     // 取值来自仪表上报的 supportSpeechEngine，默认 2。1.0.11 之前我们完全没发，
                     // 是逐键比对里唯一「官方恒发、我方全缺」的字段。
                     "speechEngineType": Int(uint64(object["supportSpeechEngine"]) ?? 2),
-                    "appVersionFingerPrint": "iOS-\(phone.versionCode)"
+                    "appVersionFingerPrint": variant.fingerprint
                 ]
                 // 严格照官方 reply() 的二选一：仪表带 supportFunctionEx 时只回交集，
                 // 否则只回 supportFunction（回塞仪表原值）。两个键同时出现会让按 int 解析
@@ -514,6 +606,7 @@ final class TailingConnection: @unchecked Sendable {
                 // 把双向 JSON 都留在日志里：下一轮不用再猜，直接比对字段。
                 let requestText = String(decoding: request.payload, as: UTF8.self)
                 log("\(dashboard) 0x10010 请求 \(request.payload.count) 字节：\(requestText)")
+                log("\(dashboard) 身份变体「\(variant.name)」：package=\(variant.package)，\(variant.os) \(variant.osVersion)，\(variant.brand) \(variant.model)，versionCode=\(variant.versionCode)，token=\(variant.token)")
                 log("\(dashboard) 0x10011 回应 \(payload.count) 字节（字段 \(fields.keys.sorted().joined(separator: ","))）")
                 // 原始字节也留在日志里：仪表若不认某个转义或类型，只有对着原文才看得出来。
                 log("\(dashboard) 0x10011 原文：\(String(decoding: payload, as: UTF8.self))")
