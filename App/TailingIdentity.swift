@@ -76,32 +76,29 @@ struct TailingIdentity {
 
     /// 生成 `encryptedHUID`。
     ///
-    /// 官方 `RSAUtil.encryptHUID()` 是 `Cipher(DECRYPT_MODE, 私钥)`，也就是对 HUID 原文做
-    /// `m = padding(HUID)`、`c = m^d mod n`。仪表侧验证时用我们的公钥做 `c^e mod n` 还原原文。
-    /// 这条路我们完全可以用公钥正向算：`SecKeyCreateEncryptedData(pub, .rsaEncryptionPKCS1, HUID)`
-    /// 的结果与仪表侧 `c^e mod n` 完全等价，而且不依赖 `SecKeyCreateSignature` 的填充语义
-    /// （1.0.9 实车回包用 `.rsaSignatureDigestPKCS1v15Raw` 生成，离线用公钥还原出来是乱码，
-    /// 说明那套签名路径与导出的公钥并不自洽）。
+    /// 官方 `RSAUtil.encryptHUID()` 是 `Cipher(ENCRYPT_MODE, 私钥)` + `RSA/ECB/PKCS1Padding`，
+    /// 也就是 PKCS#1 v1.5 **type 1**（签名型）填充后做私钥运算；仪表侧用
+    /// `Cipher(DECRYPT_MODE, 公钥)` 还原，等价于 `c^e mod n` 取出 `00 01 FF..FF 00 HUID`。
+    /// Apple 的 `.rsaSignatureDigestPKCS1v15Raw` 正是这条运算：1.0.9 实车回包已离线验证过
+    /// `pow(encryptedHUID, e, n)` = `00 01 FF…FF 00 P1AK6GK01004641`，与官方字节结构一致。
+    /// （1.0.10 曾改用 `.rsaEncryptionPKCS1` 公钥加密，方向反了——type 2 填充，公钥算不回去。）
     func sign(_ huid: String) throws -> Data {
         let message = Data(huid.utf8)
         guard !message.isEmpty, message.count <= SecKeyGetBlockSize(key) - 11 else {
             throw TailingError.protocolFailure("仪表身份长度异常")
         }
-        guard let publicKey = SecKeyCopyPublicKey(key) else {
-            throw TailingError.protocolFailure("本机公钥缺失")
-        }
         var error: Unmanaged<CFError>?
-        guard let cipher = SecKeyCreateEncryptedData(publicKey, .rsaEncryptionPKCS1, message as CFData, &error) else {
+        guard let signature = SecKeyCreateSignature(key, .rsaSignatureDigestPKCS1v15Raw, message as CFData, &error) else {
             throw error!.takeRetainedValue()
         }
-        return cipher as Data
+        return signature as Data
     }
 
-    /// 用私钥把密文还原，验证它与 HUID 原文一致。仪表回显的正是这段密文本身。
     func verify(_ signature: Data, huid: String) throws {
+        guard let publicKey = SecKeyCopyPublicKey(key) else { throw TailingError.protocolFailure("本机公钥缺失") }
         var error: Unmanaged<CFError>?
-        guard let plain = SecKeyCreateDecryptedData(key, .rsaEncryptionPKCS1, signature as CFData, &error),
-              plain as Data == Data(huid.utf8) else {
+        guard SecKeyVerifySignature(publicKey, .rsaSignatureDigestPKCS1v15Raw,
+                                    Data(huid.utf8) as CFData, signature as CFData, &error) else {
             throw TailingError.protocolFailure("媒体通道身份回显校验失败")
         }
     }

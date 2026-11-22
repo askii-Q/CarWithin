@@ -524,12 +524,12 @@ final class TailingConnection: @unchecked Sendable {
                 condition.lock(); let identity = self.identity; condition.unlock()
                 guard let identity else { throw TailingError.closed }
                 let signature = try identity.sign(huid)
-                // 先在设备上自证：密文用私钥还原必须等于 HUID。日志里留一行，免得再靠实车猜。
+                // PKCS#1 type 1 自检：仪表用公钥做 c^e mod n 必须能取回 HUID。
                 do {
                     try identity.verify(signature, huid: huid)
-                    log("\(dashboard) 身份密文自检通过（\(signature.count) 字节，私钥还原与 HUID 一致）")
+                    log("\(dashboard) 身份签名自检通过（\(signature.count) 字节，PKCS#1 type 1，公钥可还原 HUID）")
                 } catch {
-                    log("\(dashboard) 身份密文自检失败：\(error)")
+                    log("\(dashboard) 身份签名自检失败：\(error)")
                 }
                 var fields: [String: Any] = [
                     "pxcVersion": "1.0.2", "phoneUUID": identity.phoneID,
@@ -542,27 +542,24 @@ final class TailingConnection: @unchecked Sendable {
                     "supportH264IFrame": true,
                     "appVersionFingerPrint": "iOS-\(phone.versionCode)"
                 ]
-                // 官方 reply() 里 supportFunction 与 supportFunctionEx 二选一：仪表带
-                // supportFunctionEx 时只回交集，否则回 supportFunction。两个都发会让部分
-                // 固件走错分支，这里严格照官方行为分叉。
-                // 官方 reply() 在 isNewSupportFunction 为真时只写 supportFunctionEx；
-                // 但固件解析器只要漏读一个键就会把这段回包判为无效（1.0.8 实测：回
-                // Ex=0 被立刻 RST）。这里两个键同时给：supportFunction 回塞仪表原值，
-                // supportFunctionEx 给能力交集，任一解析路径都能拿到完整能力表。
-                let carMask = uint64(object["supportFunction"]) ?? 128
-                fields["supportFunction"] = carMask
+                // 严格照官方 reply() 的二选一：仪表带 supportFunctionEx 时只回交集，
+                // 否则只回 supportFunction（回塞仪表原值）。两个键同时出现会让按 int 解析
+                // 该字段的固件在 supportFunctionEx 溢出时报错——1.0.9 把 0xFFBFFFDF 一起发出去，
+                // 仪表随即 RST，这是目前最可疑的一处。
+                let carMask = uint64(object["supportFunction"]) ?? 0
                 if let requested = uint64(object["supportFunctionEx"]) {
                     let mask = TailingCapabilities.exclusive & requested
                     fields["supportFunctionEx"] = mask
-                    log("\(dashboard) 仪表报 supportFunction=\(carMask)、supportFunctionEx=\(requested)，回应交集 \(mask)")
-                } else if carMask != 128 {
-                    log("\(dashboard) 仪表报 supportFunction=\(carMask)，按原值回应")
+                    log("\(dashboard) 仪表报 supportFunctionEx=\(requested)，只回应交集 \(mask)")
+                } else {
+                    fields["supportFunction"] = carMask
+                    log("\(dashboard) 仪表报 supportFunction=\(carMask)，只回应原值")
                 }
                 payload = try TailingProtocol.json(fields)
                 // 把双向 JSON 都留在日志里：下一轮不用再猜，直接比对字段。
                 let requestText = String(decoding: request.payload, as: UTF8.self)
-                log("\(dashboard) 0x10010 请求 \(request.payload.count) 字节：\(requestText.prefix(700))")
-                log("\(dashboard) 0x10011 回应 \(payload.count) 字节：\(String(decoding: payload, as: UTF8.self).prefix(700))")
+                log("\(dashboard) 0x10010 请求 \(request.payload.count) 字节：\(requestText)")
+                log("\(dashboard) 0x10011 回应 \(payload.count) 字节（字段 \(fields.keys.sorted().joined(separator: ","))）")
                 try replyControl(socket, request, payload: payload)
                 condition.lock()
                 self.huid = huid; signedHUID = signature; condition.broadcast()
