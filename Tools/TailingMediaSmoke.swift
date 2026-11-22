@@ -81,7 +81,7 @@ func tailingMediaSmoke() throws {
     defer { announcement.close() }
     let reserved = try (0..<3).map { _ in try TailingSocket.listening(localIP: "127.0.0.1", port: 0) }
     let ports = try TailingPorts(control: reserved[0].localPort, auxiliary: reserved[1].localPort,
-        video: reserved[2].localPort, announcement: announcement.localPort)
+        video: reserved[2].localPort, announcement: announcement.localPort, mediaControl: 0, mediaData: 0)
     reserved.forEach { $0.close() }
     let identity = try TailingIdentity.generate()
     let done = DispatchSemaphore(value: 0)

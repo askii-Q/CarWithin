@@ -32,9 +32,21 @@ struct TailingPorts {
     let video: UInt16
     /// 未验证型号可能把投屏请求端口放在别处，协商期允许改写。
     var announcement: UInt16
+    /// 官方 App（EasyConn SDK）起 PXC 后默认监听的「新媒体」通道：控制 10921、数据 10920。
+    /// 二代仪表实测会优先回连这一对端口，旧 RV 通道（10711/10710）只在仪表另外请求时才出现。
+    /// 置 0 表示不监听该端口，方便冒烟测试避开真实端口。
+    var mediaControl: UInt16 = 10_921
+    var mediaData: UInt16 = 10_920
     static let ios = TailingPorts(control: 10922, auxiliary: 10711, video: 10710, announcement: 10930)
     /// 首次请求被拒绝时用于诊断与回退的探测范围。
     static let announcementProbeRange: ClosedRange<UInt16> = 10_700...10_999
+}
+
+/// 官方 `ECP_C2P_CLIENT_INFO.reply()` 里 supportFunctionEx 回的是
+/// `getAllSupportFunctionEx() & 仪表请求值`。本实现没有对应的新媒体特性，
+/// 如实回 0，只把仪表请求原值记进日志，便于后续按实测补位。
+enum TailingCapabilities {
+    static let exclusive: UInt64 = 0
 }
 
 /// 台铃 JPEG 和极核 H.264 共用的 PXC 投屏会话。
@@ -65,8 +77,30 @@ final class TailingConnection: @unchecked Sendable {
     private var sentH264Prefix = false
     private var mediaStarted = false
     private var configured = false
+    private var movieMode = false
     private var isZeeho: Bool { profile.isZeeho }
     private var dashboard: String { profile.isZeeho ? "极核" : "台铃" }
+
+    /// 旧 RV 通道（10711/10710）与新媒体通道（10921/10920）在官方 App 里走同一套
+    /// 线程与命令集，只影响日志标注与「谁是数据通道」的判定。
+    private func portRole(_ port: UInt16) -> String {
+        if port == ports.control { return "会话控制" }
+        if port == ports.mediaControl { return "新媒体控制" }
+        if port == ports.auxiliary { return "旧媒体控制" }
+        if port == ports.mediaData { return "新媒体数据" }
+        if port == ports.video { return "旧媒体数据" }
+        return "未知通道"
+    }
+
+    private func isVideoPort(_ port: UInt16) -> Bool { port == ports.video || port == ports.mediaData }
+    private func isMediaControlPort(_ port: UInt16) -> Bool { port == ports.auxiliary || port == ports.mediaControl }
+
+    /// 仪表下发的位图既可能是 JSON 数字，也可能是字符串（部分固件），两种都认。
+    private func uint64(_ value: Any?) -> UInt64? {
+        if let number = value as? NSNumber { return number.uint64Value }
+        if let text = value as? String { return UInt64(text) }
+        return nil
+    }
 
     init(localIP: String, targetIP: String, profile: TailingDisplayProfile, phone: TailingPhoneInfo,
          ports: TailingPorts = .ios, identityProvider: @escaping () throws -> TailingIdentity = TailingIdentity.load,
@@ -84,8 +118,12 @@ final class TailingConnection: @unchecked Sendable {
         let loaded = try identityProvider()
         condition.lock(); identity = loaded; condition.unlock()
         // 先全部监听，再请求仪表反向连接；不使用所有网卡的通配地址。
+        var listenPorts: [UInt16] = [ports.control, ports.auxiliary, ports.video]
+        for port in [ports.mediaControl, ports.mediaData] where port != 0 && !listenPorts.contains(port) {
+            listenPorts.append(port)
+        }
         var listeners: [(UInt16, TailingSocket)] = []
-        for port in [ports.control, ports.auxiliary, ports.video] {
+        for port in listenPorts {
             let server = try tracked(TailingSocket.create())
             try server.listen(localIP: localIP, port: port)
             listeners.append((port, server))
@@ -93,7 +131,8 @@ final class TailingConnection: @unchecked Sendable {
         for (port, server) in listeners {
             DispatchQueue.global(qos: .userInitiated).async { [self] in accept(server, port: port) }
         }
-        log("\(dashboard) TCP 已监听 \(localIP):\(ports.control)/\(ports.auxiliary)/\(ports.video)，正在协商")
+        let summary = listenPorts.map { "\($0)（\(portRole($0))）" }.joined(separator: "，")
+        log("\(dashboard) TCP 已监听 \(localIP)：\(summary)，正在协商")
         // 仪表可能晚于本机进入投屏状态，也可能正被官方 App 占用而短暂拒绝连接。
         // 协商窗口内持续重发投屏请求，任意一次成功即可，而不是一次失败就结束会话。
         let deadline = Date().addingTimeInterval(negotiationTimeout)
@@ -328,23 +367,34 @@ final class TailingConnection: @unchecked Sendable {
     }
 
     private func accept(_ server: TailingSocket, port: UInt16) {
+        let role = portRole(port)
         do {
             while true {
                 let socket = try tracked(server.accept(remoteIP: targetIP))
-                if isZeeho { log("极核 TCP\(port) 已回连") }
-                if port == ports.video {
+                // 每次回连都记录：实测日志里最缺的就是「仪表到底连了哪个端口」。
+                log("\(dashboard) 仪表回连 TCP\(port)（\(role)）")
+                if isVideoPort(port) {
                     condition.lock()
-                    if video == nil && !closed { video = socket; condition.broadcast() }
-                    else { socket.close() }
-                    condition.unlock()
+                    if video == nil && !closed {
+                        video = socket
+                        condition.broadcast()
+                        condition.unlock()
+                        log("\(dashboard) 视频通道就绪：TCP\(port)（\(role)）")
+                    } else {
+                        condition.unlock()
+                        log("\(dashboard) 视频通道已存在，忽略 TCP\(port) 的第二个数据连接")
+                        socket.close()
+                    }
+                } else if isMediaControlPort(port) {
+                    DispatchQueue.global(qos: .userInitiated).async { [self] in
+                        do { try auxiliary(socket, port: port) } catch {
+                            fail(TailingError.channel("媒体控制 TCP\(port)", error))
+                        }
+                    }
                 } else {
                     DispatchQueue.global(qos: .userInitiated).async { [self] in
-                        do {
-                            if port == ports.auxiliary { try auxiliary(socket) }
-                            else { try control(socket) }
-                        } catch {
-                            let channel = port == ports.auxiliary ? "媒体控制 TCP\(port)" : "会话控制 TCP\(port)"
-                            fail(TailingError.channel(channel, error))
+                        do { try control(socket) } catch {
+                            fail(TailingError.channel("会话控制 TCP\(port)", error))
                         }
                     }
                 }
@@ -388,20 +438,37 @@ final class TailingConnection: @unchecked Sendable {
                 condition.lock(); let identity = self.identity; condition.unlock()
                 guard let identity else { throw TailingError.closed }
                 let signature = try identity.sign(huid)
-                payload = try TailingProtocol.json([
+                var fields: [String: Any] = [
                     "pxcVersion": "1.0.2", "phoneUUID": identity.phoneID,
                     "phoneBrand": "iPhone", "phoneModel": phone.model,
                     "phoneOsVersion": phone.systemVersion, "phoneOs": "iOS",
                     "package": phone.package, "versionCode": phone.versionCode, "token": 0,
                     "pubkey": try identity.publicKey().base64EncodedString(),
                     "encryptedHUID": signature.base64EncodedString(), "bluetoothName": "",
-                    "supportH264IFrame": isZeeho, "supportFunction": 128, "mirrorRequestReconnect": true
-                ])
+                    "supportH264IFrame": isZeeho, "mirrorRequestReconnect": true,
+                    "appVersionFingerPrint": "iOS-\(phone.versionCode)"
+                ]
+                // 官方 reply() 里 supportFunction 与 supportFunctionEx 二选一：仪表带
+                // supportFunctionEx 时只回交集，否则回 supportFunction。两个都发会让部分
+                // 固件走错分支，这里严格照官方行为分叉。
+                if let requested = uint64(object["supportFunctionEx"]) {
+                    let mask = TailingCapabilities.exclusive & requested
+                    fields["supportFunctionEx"] = mask
+                    log("\(dashboard) 仪表请求 supportFunctionEx=\(requested)，回应交集 \(mask)")
+                } else {
+                    fields["supportFunction"] = 128
+                }
+                payload = try TailingProtocol.json(fields)
                 try replyControl(socket, request, payload: payload)
                 condition.lock()
                 self.huid = huid; signedHUID = signature; condition.broadcast()
                 condition.unlock()
                 log("仪表报告 HUName=\(name.debugDescription)，已回应本机 RSA2048 身份")
+                continue
+            case 0x107c0:
+                // 官方在此之后把媒体通道切到 TLS（wrap(true)）。本实现只有明文通道，
+                // 回包等于承诺加密，会让后续连接直接握手失败，所以只记录不回。
+                log("\(dashboard) 仪表请求启用加密通道（0x107C0），当前保持明文，忽略该请求")
                 continue
             case 0x10450:
                 let time = Int64(Date().timeIntervalSince1970 * 1_000)
@@ -488,7 +555,7 @@ final class TailingConnection: @unchecked Sendable {
         condition.unlock()
     }
 
-    private func auxiliary(_ socket: TailingSocket) throws {
+    private func auxiliary(_ socket: TailingSocket, port: UInt16) throws {
         while true {
             // 此通道可能长时间空闲，停止通过 shutdown 唤醒。
             var readingHeader = true
@@ -535,17 +602,34 @@ final class TailingConnection: @unchecked Sendable {
                 condition.lock(); let ready = configured; condition.unlock()
                 guard ready else { throw TailingError.protocolFailure("仪表在配置完成前请求媒体启动") }
                 try socket.write(TailingProtocol.auxiliary(0x71, token: request.token))
-                condition.lock(); mediaStarted = true; condition.broadcast(); condition.unlock()
+                condition.lock(); mediaStarted = true; let movie = movieMode; condition.broadcast(); condition.unlock()
+                log("\(dashboard) 媒体控制 TCP\(port) 请求启动，已回 0x71（movieMode=\(movie ? "开" : "关")）")
                 continue
             case 0x40: response = 0x41
             case 0x30:
                 response = 0x31; payload.appendLE(UInt32(5002)); payload.appendLE(UInt32(1))
             case 0x60:
-                response = 0x61; payload = try TailingProtocol.json(["supportFunction": 0])
+                response = 0x61
+                // 官方 handleConfigCaptureExtend：把仪表给的 supportFunction 原值回塞，
+                // movieMode = (v & 1)，带 viewAreaConfig 时回 state 0。回 0 会让仪表
+                // 认为手机不支持任何扩展能力，进而放弃这条媒体通道。
+                var requested: UInt64 = 0
+                var hasViewArea = false
+                if let object = try? TailingProtocol.object(request.payload) {
+                    requested = uint64(object["supportFunction"]) ?? 0
+                    hasViewArea = object["viewAreaConfig"] != nil
+                }
+                var extended: [String: Any] = ["supportFunction": requested]
+                if hasViewArea { extended["viewAreaConfig"] = ["state": 0] }
+                payload = try TailingProtocol.json(extended)
+                let movie = requested & 1 == 1
+                condition.lock(); movieMode = movie; condition.unlock()
+                log("\(dashboard) 媒体控制 TCP\(port) 扩展配置 supportFunction=\(requested)"
+                    + (hasViewArea ? "（含 viewAreaConfig）" : "") + "，movieMode=\(movie ? "开" : "关")，已原值回显")
             case 0x20: continue // 不执行反控触摸。
             default:
                 response = 0x7f02
-                log(String(format: "媒体控制通道暂不支持 0x%04x", request.command))
+                log("\(dashboard) 媒体控制 TCP\(port) 暂不支持 0x\(String(format: "%04x", request.command))，回 0x7F02")
             }
             try socket.write(TailingProtocol.auxiliary(response, token: request.token, payload: payload))
         }

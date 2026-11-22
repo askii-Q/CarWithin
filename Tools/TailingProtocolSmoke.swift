@@ -43,6 +43,8 @@ struct TailingTests {
         let stableIdentity = try TailingIdentity.generate()
         try simulatedInstrument(identity: stableIdentity, idleControlFrames: 11)
         try simulatedInstrument(identity: stableIdentity)
+        // 二代仪表实测优先回连 10921/10920（新媒体通道），这里把整套会话在该通道上再跑一遍。
+        try simulatedInstrument(identity: stableIdentity, useMediaPorts: true)
         try simulatedInstrument(identity: stableIdentity, profile: .zeeho62)
         try simulatedInstrument(identity: stableIdentity, profile: .zeeho62)
         try rejectedInstrument()
@@ -111,13 +113,19 @@ struct TailingTests {
     }
 
     private static func simulatedInstrument(identity: TailingIdentity, idleControlFrames: Int = 0,
-                                            profile: TailingDisplayProfile = .tailing43) throws {
+                                            profile: TailingDisplayProfile = .tailing43,
+                                            useMediaPorts: Bool = false) throws {
         let announcement = try TailingSocket.listening(localIP: "127.0.0.1", port: 0)
         defer { announcement.close() }
-        let reservations = try (0..<3).map { _ in try TailingSocket.listening(localIP: "127.0.0.1", port: 0) }
+        let reservations = try (0..<(useMediaPorts ? 5 : 3)).map { _ in try TailingSocket.listening(localIP: "127.0.0.1", port: 0) }
         let ports = try TailingPorts(control: reservations[0].localPort, auxiliary: reservations[1].localPort,
-                                     video: reservations[2].localPort, announcement: announcement.localPort)
+                                     video: reservations[2].localPort, announcement: announcement.localPort,
+                                     mediaControl: useMediaPorts ? reservations[3].localPort : 0,
+                                     mediaData: useMediaPorts ? reservations[4].localPort : 0)
         reservations.forEach { $0.close() }
+        // 会话必须能同时听两个媒体通道；这里把「仪表真正连哪一对」交给用例选择。
+        let auxPort = useMediaPorts ? ports.mediaControl : ports.auxiliary
+        let videoPort = useMediaPorts ? ports.mediaData : ports.video
         let connection = TailingConnection(localIP: "127.0.0.1", targetIP: "127.0.0.1", profile: profile,
             phone: TailingPhoneInfo(package: "test.ninebot", versionCode: 2, model: "iPhone", systemVersion: "17.0", width: 1320, height: 2868, rotation: 0),
             ports: ports, identityProvider: { identity }, log: { _ in })
@@ -158,6 +166,15 @@ struct TailingTests {
                 try expect(infoReply.command == 0x10011 && infoReply.identifier == 19, "身份回复")
                 let signature = Data(base64Encoded: info["encryptedHUID"] as! String)!
                 try identity.verify(signature, huid: "SIMULATED-HUID")
+                // 官方 reply 里 supportFunction 与 supportFunctionEx 二选一，仪表带扩展字段时只回交集。
+                try primary.write(TailingProtocol.control(0x10010, identifier: 26,
+                    payload: TailingProtocol.json(["HUName": isZeeho ? "ZEEHO-TEST" : "TL-DASH-V2",
+                                                   "HUID": "SIMULATED-HUID", "supportFunctionEx": 12])))
+                let exReply = try TailingProtocol.readControl { try primary.readExactly($0) }
+                let exFields = try TailingProtocol.object(exReply.payload)
+                try expect(exReply.command == 0x10011 && exFields["supportFunctionEx"] as? Int == 0,
+                           "仪表带 supportFunctionEx 时只回能力交集")
+                try expect(exFields["supportFunction"] == nil, "两个能力字段不能同时出现")
                 if isZeeho {
                     let speed = try TailingProtocol.json(["wifiSpeed": 0, "usbSpeed": 0])
                     try primary.write(TailingProtocol.control(0x10690, identifier: 20, payload: speed))
@@ -187,7 +204,7 @@ struct TailingTests {
                     }
                     try reverse.write(TailingProtocol.control(m.command == 0x205a0 ? 0x80000010 : m.command + 1, identifier: m.identifier))
                 }
-                let aux = try connect(ports.auxiliary)
+                let aux = try connect(auxPort)
                 var config = Data()
                 config.appendLE(UInt16(isZeeho ? 1024 : 480))
                 config.appendLE(UInt16(isZeeho ? 488 : 272))
@@ -202,7 +219,16 @@ struct TailingTests {
                 try aux.write(TailingProtocol.auxiliary(0x40, token: 58) + TailingProtocol.auxiliary(0x70, token: 59))
                 try expect(try TailingProtocol.readAuxiliary { try aux.readExactly($0) }.token == 58, "媒体心跳回应")
                 try expect(try TailingProtocol.readAuxiliary { try aux.readExactly($0) }.command == 0x71, "媒体启动回应")
-                let video = try connect(ports.video)
+                // 扩展配置必须原值回显；回 0 会让仪表认为手机不支持任何扩展能力。
+                try aux.write(TailingProtocol.auxiliary(0x60, token: 62,
+                    payload: TailingProtocol.json(["supportFunction": 5, "viewAreaConfig": ["x": 1]])))
+                let extended = try TailingProtocol.readAuxiliary { try aux.readExactly($0) }
+                let extendedFields = try TailingProtocol.object(extended.payload)
+                try expect(extended.command == 0x61 && extended.token == 62 &&
+                           extendedFields["supportFunction"] as? Int == 5, "扩展配置原值回显")
+                try expect((extendedFields["viewAreaConfig"] as? [String: Any])?["state"] as? Int == 0,
+                           "含 viewAreaConfig 时回 state 0")
+                let video = try connect(videoPort)
                 for index in 0..<(isZeeho ? 2 : 1) {
                     try video.write(TailingProtocol.auxiliary(0x72))
                     if isZeeho && index == 0 {
@@ -277,8 +303,10 @@ struct TailingTests {
         holdingVideo.signal()
         try expect(done.wait(timeout: .now() + 2) == .success, "模拟仪表线程退出")
         if let error = result.get() { throw error }
-        // 原三个端口须能立即重用，不能残留监听。
-        for port in [ports.control, ports.auxiliary, ports.video] {
+        // 本次会话监听的端口须能立即重用，不能残留监听。
+        var releasedPorts: [UInt16] = [ports.control, ports.auxiliary, ports.video]
+        if useMediaPorts { releasedPorts.append(contentsOf: [ports.mediaControl, ports.mediaData]) }
+        for port in releasedPorts {
             let rebound = try TailingSocket.listening(localIP: "127.0.0.1", port: port)
             rebound.close()
         }
@@ -289,7 +317,8 @@ struct TailingTests {
         defer { server.close() }
         let reservations = try (0..<3).map { _ in try TailingSocket.listening(localIP: "127.0.0.1", port: 0) }
         let ports = try TailingPorts(control: reservations[0].localPort, auxiliary: reservations[1].localPort,
-                                     video: reservations[2].localPort, announcement: server.localPort)
+                                     video: reservations[2].localPort, announcement: server.localPort,
+                                     mediaControl: 0, mediaData: 0)
         reservations.forEach { $0.close() }
         let identity = try TailingIdentity.generate()
         let connection = TailingConnection(localIP: "127.0.0.1", targetIP: "127.0.0.1", profile: .tailing43,
@@ -323,7 +352,8 @@ struct TailingTests {
         defer { server.close() }
         let reservations = try (0..<3).map { _ in try TailingSocket.listening(localIP: "127.0.0.1", port: 0) }
         let ports = try TailingPorts(control: reservations[0].localPort, auxiliary: reservations[1].localPort,
-                                     video: reservations[2].localPort, announcement: server.localPort)
+                                     video: reservations[2].localPort, announcement: server.localPort,
+                                     mediaControl: 0, mediaData: 0)
         reservations.forEach { $0.close() }
         let identity = try TailingIdentity.generate()
         let connection = TailingConnection(localIP: "127.0.0.1", targetIP: "127.0.0.1", profile: .tailing43,

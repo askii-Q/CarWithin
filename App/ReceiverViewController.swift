@@ -233,6 +233,16 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
     private static let supportURL = URL(string: "https://qr.alipay.com/fkx16608y1puemmltuocze0")!
     private static let authorURL = URL(string: "https://v.douyin.com/x64M2NbYj0A/")!
     private var lines: [String] = []
+    /// 实车测试常常要跑十几分钟，日志既留在内存也落盘，App 被系统回收后仍能取回。
+    private static let logLimit = 1_000
+    private static let logFileLimit = 400 * 1_024
+    private let logQueue = DispatchQueue(label: "com.hanlin.carwithin.logfile", qos: .utility)
+    private var logFileHandle: FileHandle?
+    private var logFileBytes = 0
+    private var logFileURL: URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("CarWithin-log.txt")
+    }
     private var launchedTransportTest = false
 
     override func viewDidAppear(_ animated: Bool) {
@@ -1816,12 +1826,95 @@ final class ReceiverViewController: UIViewController, CLLocationManagerDelegate 
     @objc private func copyLog() { UIPasteboard.general.string = lines.joined(separator: "\n") }
     private func log(_ message: String) {
         let timestamp = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
-        lines.append("\(timestamp)  \(message)"); if lines.count > 200 { lines.removeFirst(lines.count - 200) }
+        let line = "\(timestamp)  \(message)"
+        lines.append(line)
+        if lines.count > Self.logLimit { lines.removeFirst(lines.count - Self.logLimit) }
+        appendToLogFile(line)
         if logView.window != nil {
             logView.text = lines.joined(separator: "\n")
             if !logView.text.isEmpty { logView.scrollRangeToVisible(NSRange(location: logView.text.utf16.count - 1, length: 1)) }
         }
         NSLog("[CarWithin] %@", message)
+    }
+
+    /// 追加一行到文稿目录的日志文件；超过上限时裁掉前半段，避免无限增长。
+    private func appendToLogFile(_ line: String) {
+        let url = logFileURL
+        logQueue.async { [weak self] in
+            guard let self else { return }
+            do {
+                if self.logFileHandle == nil {
+                    if !FileManager.default.fileExists(atPath: url.path) {
+                        FileManager.default.createFile(atPath: url.path, contents: nil)
+                    }
+                    let handle = try FileHandle(forWritingTo: url)
+                    try handle.seekToEnd()
+                    if let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+                       let size = attributes[.size] as? UInt64 {
+                        self.logFileBytes = Int(size)
+                    } else {
+                        self.logFileBytes = 0
+                    }
+                    self.logFileHandle = handle
+                }
+                let data = Data((line + "\n").utf8)
+                try self.logFileHandle?.write(contentsOf: data)
+                self.logFileBytes += data.count
+                if self.logFileBytes > Self.logFileLimit { try self.trimLogFile(url) }
+            } catch {
+                // 落盘失败不影响界面上的日志，下一行会重新打开文件。
+                self.logFileHandle = nil
+            }
+        }
+    }
+
+    /// 只保留最后 2000 行，重写文件后继续追加。
+    private func trimLogFile(_ url: URL) throws {
+        let text = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+        let kept = text.split(separator: "\n", omittingEmptySubsequences: false).suffix(2_000).joined(separator: "\n") + "\n"
+        try logFileHandle?.close()
+        logFileHandle = nil
+        try kept.write(to: url, atomically: true, encoding: .utf8)
+        let handle = try FileHandle(forWritingTo: url)
+        try handle.seekToEnd()
+        logFileBytes = kept.utf8.count
+        logFileHandle = handle
+    }
+
+    /// 等待已排队的写入落地，返回可用作附件的日志文件。
+    private func flushLogFile() -> URL? {
+        logQueue.sync {}
+        let url = logFileURL
+        if !FileManager.default.fileExists(atPath: url.path) {
+            try? (lines.joined(separator: "\n") + "\n").write(to: url, atomically: true, encoding: .utf8)
+        }
+        return FileManager.default.fileExists(atPath: url.path) ? url : nil
+    }
+
+    private func exportLogFile() {
+        guard let url = flushLogFile() else {
+            alert("没有日志", "还没有产生任何日志。")
+            return
+        }
+        let sheet = UIActivityViewController(activityItems: [url], applicationActivities: nil)
+        if let popover = sheet.popoverPresentationController {
+            popover.sourceView = view
+            popover.sourceRect = CGRect(x: view.bounds.midX, y: view.bounds.midY, width: 1, height: 1)
+            popover.permittedArrowDirections = []
+        }
+        (settingsNavigation ?? self).present(sheet, animated: true)
+    }
+
+    private func clearLog() {
+        lines.removeAll()
+        logView.text = ""
+        logQueue.async { [weak self] in
+            guard let self else { return }
+            try? self.logFileHandle?.close()
+            self.logFileHandle = nil
+            self.logFileBytes = 0
+            try? FileManager.default.removeItem(at: self.logFileURL)
+        }
     }
 }
 
@@ -2749,10 +2842,19 @@ extension ReceiverViewController {
     fileprivate func logPage() -> SettingsPageController {
         let controller = page("日志") { [unowned self] in
             [
-                SettingsSection(footer: "最近 200 条，不含 Wi-Fi 密码和 MFi 私钥。", [.view(logView)]),
-                SettingsSection([.action("复制日志", icon: ("doc.on.doc.fill", .systemBlue)) { [unowned self] in
-                    self.copyLog(); self.alert("已复制", "日志已复制到剪贴板。")
-                }])
+                SettingsSection(footer: "最近 \(Self.logLimit) 条，同时实时写入「文稿/CarWithin-log.txt」（上限 400 KB，超限只保留最后 2000 行）；不含 Wi-Fi 密码和 MFi 私钥。",
+                                [.view(logView)]),
+                SettingsSection([
+                    .action("复制日志", icon: ("doc.on.doc.fill", .systemBlue)) { [unowned self] in
+                        self.copyLog(); self.alert("已复制", "日志已复制到剪贴板。")
+                    },
+                    .action("导出日志文件", icon: ("square.and.arrow.up.fill", .systemGreen)) { [unowned self] in
+                        self.exportLogFile()
+                    },
+                    .action("清空日志", icon: ("trash.fill", .systemRed)) { [unowned self] in
+                        self.clearLog(); self.alert("已清空", "内存与文件中的日志都已删除。")
+                    }
+                ])
             ]
         }
         logView.constraints.filter { $0.firstAttribute == .height }.forEach { $0.constant = 380 }

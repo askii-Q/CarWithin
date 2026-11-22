@@ -1,0 +1,37 @@
+name: IPA
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ipa:
+    name: 构建未签名 IPA
+    runs-on: macos-14
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 工具链版本
+        run: |
+          xcodebuild -version
+          xcodebuild -showsdks | grep -i iphoneos || true
+
+      - name: 生成工程并构建 IPA
+        run: bash Tools/build_ipa.sh
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: CarWithin-unsigned-ipa
+          path: build/*.ipa
+          if-no-files-found: error
+          retention-days: 14
