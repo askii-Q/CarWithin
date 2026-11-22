@@ -370,6 +370,12 @@ struct TailingTests {
         defer { requestSocket.close() }
         _ = try TailingProtocol.readControl { try requestSocket.readExactly($0) }
         connection.close() // 不发送启动回复，必须立即中断read而非等3秒超时。
-        try expect(done.wait(timeout: .now() + 1) == .success && stopped.get(), "协商中停止需及时退出")
+        let cancelStarted = Date()
+        let finished = done.wait(timeout: .now() + 3) == .success
+        let elapsed = Date().timeIntervalSince(cancelStarted)
+        let seconds = String(format: "%.2f", elapsed)
+        try expect(finished, "协商中停止需在 3 秒内返回，实测 \(seconds) 秒")
+        try expect(stopped.get(), "协商中停止应抛出取消错误，实测 \(seconds) 秒返回")
+        try expect(elapsed < 1.5, "协商中停止需及时退出，实测 \(seconds) 秒")
     }
 }
