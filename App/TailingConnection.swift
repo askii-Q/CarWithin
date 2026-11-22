@@ -44,7 +44,12 @@ struct TailingPorts {
 /// `getAllSupportFunctionEx() & 仪表请求值`。本实现没有对应的新媒体特性，
 /// 如实回 0，只把仪表请求原值记进日志，便于后续按实测补位。
 enum TailingCapabilities {
-    static let exclusive: UInt64 = 0
+    /// 官方 `ECP_C2P_CLIENT_INFO.getAllSupportFunctionEx()` 的返回值（`0xFFBFFFDF`，
+    /// 30 个能力位，只有 bit5 与 bit22 未置位）。台铃仪表带 `supportFunctionEx`
+    /// 请求时，官方回的是 `getAllSupportFunctionEx() & 仪表请求值`；本实现只做镜像
+    /// 转发，不消费这些能力，但**必须如实汇报同一张表**——回 0 等于告诉仪表
+    /// “这台手机什么特性都不支持”，仪表会直接 RST（1.0.8 实车日志即如此）。
+    static let exclusive: UInt64 = 0xFFBF_FFDF
 }
 
 /// 台铃 JPEG 和极核 H.264 共用的 PXC 投屏会话。
@@ -545,6 +550,10 @@ final class TailingConnection: @unchecked Sendable {
                     if carMask != 128 { log("\(dashboard) 仪表报 supportFunction=\(carMask)，按原值回应") }
                 }
                 payload = try TailingProtocol.json(fields)
+                // 把双向 JSON 都留在日志里：下一轮不用再猜，直接比对字段。
+                let requestText = String(decoding: request.payload, as: UTF8.self)
+                log("\(dashboard) 0x10010 请求 \(request.payload.count) 字节：\(requestText.prefix(700))")
+                log("\(dashboard) 0x10011 回应 \(payload.count) 字节：\(String(decoding: payload, as: UTF8.self).prefix(700))")
                 try replyControl(socket, request, payload: payload)
                 condition.lock()
                 self.huid = huid; signedHUID = signature; condition.broadcast()
@@ -595,7 +604,10 @@ final class TailingConnection: @unchecked Sendable {
     }
 
     private func replyControl(_ socket: TailingSocket, _ request: TailingProtocol.Control, payload: Data) throws {
-        try socket.write(TailingProtocol.control(request.command &+ 1, identifier: request.identifier, payload: payload))
+        // 官方 `SendCmdProcessor.sendCmd()` 每次都用一个全新的 CmdBaseHead（`mCmdBaseReq`），
+        // 帧头第 12..15 字节始终是 0，不会回显请求里的 identifier。
+        _ = request
+        try socket.write(TailingProtocol.control(request.command &+ 1, identifier: 0, payload: payload))
     }
 
     private func sendControl(_ socket: TailingSocket, command: UInt32, identifier: UInt32,

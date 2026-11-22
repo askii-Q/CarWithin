@@ -163,7 +163,7 @@ struct TailingTests {
                     payload: TailingProtocol.json(["HUName": isZeeho ? "ZEEHO-TEST" : "TL-DASH-V2", "HUID": "SIMULATED-HUID"])))
                 let infoReply = try TailingProtocol.readControl { try primary.readExactly($0) }
                 let info = try TailingProtocol.object(infoReply.payload)
-                try expect(infoReply.command == 0x10011 && infoReply.identifier == 19, "身份回复")
+                try expect(infoReply.command == 0x10011 && infoReply.identifier == 0, "身份回复（帧头 identifier 按官方恒为 0）")
                 let signature = Data(base64Encoded: info["encryptedHUID"] as! String)!
                 try identity.verify(signature, huid: "SIMULATED-HUID")
                 // 官方 reply 里 supportFunction 与 supportFunctionEx 二选一，仪表带扩展字段时只回交集。
@@ -172,8 +172,8 @@ struct TailingTests {
                                                    "HUID": "SIMULATED-HUID", "supportFunctionEx": 12])))
                 let exReply = try TailingProtocol.readControl { try primary.readExactly($0) }
                 let exFields = try TailingProtocol.object(exReply.payload)
-                try expect(exReply.command == 0x10011 && exFields["supportFunctionEx"] as? Int == 0,
-                           "仪表带 supportFunctionEx 时只回能力交集")
+                try expect(exReply.command == 0x10011 && exFields["supportFunctionEx"] as? UInt64 == 12,
+                           "仪表带 supportFunctionEx 时回 0xFFBFFFDF 与请求值的交集")
                 try expect(exFields["supportFunction"] == nil, "两个能力字段不能同时出现")
                 if isZeeho {
                     let speed = try TailingProtocol.json(["wifiSpeed": 0, "usbSpeed": 0])
