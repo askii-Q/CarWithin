@@ -174,7 +174,8 @@ struct TailingTests {
                 let head = try TailingProtocol.control(0x10000, identifier: 17)
                 try primary.write(Data(head.prefix(5)))
                 try primary.write(Data(head.dropFirst(5)))
-                try expect(try TailingProtocol.readControl { try primary.readExactly($0) }.identifier == 17, "主控制回显标识")
+                try expect(try TailingProtocol.readControl { try primary.readExactly($0) }.identifier == 0,
+                           "握手应答的 token 恒为 0（Go 实现同此，官方式是复用请求头）")
                 try primary.write(TailingProtocol.control(0x10010, identifier: 19,
                     payload: TailingProtocol.json(["HUName": isZeeho ? "ZEEHO-TEST" : "TL-DASH-V2", "HUID": "SIMULATED-HUID"])))
                 let infoReply = try TailingProtocol.readControl { try primary.readExactly($0) }
@@ -208,7 +209,8 @@ struct TailingTests {
                 }
                 let reverse = try connect(ports.control)
                 try reverse.write(TailingProtocol.control(0x20000, identifier: 22))
-                try expect(try TailingProtocol.readControl { try reverse.readExactly($0) }.identifier == 22, "反向控制标识")
+                try expect(try TailingProtocol.readControl { try reverse.readExactly($0) }.identifier == 0,
+                           "反向控制应答的 token 同样为 0")
                 for _ in 0..<(isZeeho ? 6 : 5) {
                     let m = try TailingProtocol.readControl { try reverse.readExactly($0) }
                     if m.command == 0x20030 {
